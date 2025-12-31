@@ -8,7 +8,7 @@ import 'package:youtube_explode_dart/youtube_explode_dart.dart';
 class AudioPlayerPage extends StatefulWidget {
   final String videoId;
   final double position;
-  const AudioPlayerPage({Key? key, required this.videoId, required this.position}) : super(key: key);
+  const AudioPlayerPage({super.key, required this.videoId, required this.position});
 
   @override
   State<AudioPlayerPage> createState() => _AudioPlayerPageState();
@@ -85,10 +85,12 @@ class _AudioPlayerPageState extends State<AudioPlayerPage> {
                 maxChildSize: 0.4,
                 builder: (context, scrollController) {
                   return Container(
-                    decoration: BoxDecoration(
+                    decoration: const BoxDecoration(
                       color: Colors.white,
                       borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
-                      boxShadow: [BoxShadow(color: Colors.black26, blurRadius: 8)],
+                      boxShadow: [
+                        BoxShadow(color: Colors.black26, blurRadius: 8),
+                      ],
                     ),
                     padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 16),
                     child: ListView(

@@ -13,10 +13,12 @@ Future<void> main() async {
     androidNotificationChannelName: 'BackTube Audio Playback',
     androidNotificationOngoing: true,
   );
-  runApp(MaterialApp(home: WebViewPage()));
+  runApp(const MaterialApp(home: WebViewPage()));
 }
 
 class WebViewPage extends StatefulWidget {
+  const WebViewPage({super.key});
+
   @override
   State<WebViewPage> createState() => _WebViewPageState();
 }
@@ -25,12 +27,93 @@ class _WebViewPageState extends State<WebViewPage> with WidgetsBindingObserver {
   AudioPlayer? _player;
   bool _audioLoading = false;
   bool _audioPlaying = false;
-  String? _currentVideoId;
-  bool _showNavButtons = false;
-  late DateTime _lastShowTime;
-  static const Duration _buttonVisibleDuration = Duration(seconds: 3);
   late final WebViewController _controller;
   static const String _jsChannelName = 'FullscreenListener';
+
+  int? _swipePointerId;
+  Offset? _swipeStart;
+  DateTime? _swipeStartTime;
+  bool _swipeNavInProgress = false;
+
+  Future<void> _kickWebViewRender() async {
+    try {
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      await _controller.runJavaScript(r"""
+(function() {
+  try {
+    // paint 갱신 유도 (스크롤 위치는 원복)
+    window.scrollBy(0, 1);
+    window.scrollBy(0, -1);
+    window.dispatchEvent(new Event('scroll'));
+    window.dispatchEvent(new Event('resize'));
+  } catch (e) {}
+})();
+""");
+    } catch (_) {
+      // ignore
+    }
+  }
+
+  Future<void> _goBackWithRepaint() async {
+    if (await _controller.canGoBack()) {
+      await _controller.goBack();
+      await _kickWebViewRender();
+    }
+  }
+
+  Future<void> _goForwardWithRepaint() async {
+    if (await _controller.canGoForward()) {
+      await _controller.goForward();
+      await _kickWebViewRender();
+    }
+  }
+
+  void _onPointerDown(PointerDownEvent e) {
+    // 멀티터치/중복 포인터는 무시
+    if (_swipePointerId != null) return;
+    _swipePointerId = e.pointer;
+    _swipeStart = e.position;
+    _swipeStartTime = DateTime.now();
+  }
+
+  void _onPointerUp(PointerUpEvent e) {
+    if (_swipePointerId != e.pointer) return;
+
+    final start = _swipeStart;
+    final startTime = _swipeStartTime;
+    _swipePointerId = null;
+    _swipeStart = null;
+    _swipeStartTime = null;
+
+    if (start == null || startTime == null) return;
+
+    final dtMs = DateTime.now().difference(startTime).inMilliseconds;
+    if (dtMs <= 0 || dtMs > 600) return;
+
+    final dx = e.position.dx - start.dx;
+    final dy = e.position.dy - start.dy;
+
+    // 수평 스와이프만(세로 스크롤은 통과)
+    if (dx.abs() < 80) return;
+    if (dx.abs() < (dy.abs() * 1.5)) return;
+
+    if (_swipeNavInProgress) return;
+    _swipeNavInProgress = true;
+
+    Future<void>(() async {
+      try {
+        if (dx > 0) {
+          // 좌→우: 이전
+          await _goBackWithRepaint();
+        } else {
+          // 우→좌: 앞으로
+          await _goForwardWithRepaint();
+        }
+      } finally {
+        _swipeNavInProgress = false;
+      }
+    });
+  }
 
   @override
   void initState() {
@@ -90,7 +173,7 @@ class _WebViewPageState extends State<WebViewPage> with WidgetsBindingObserver {
     final videoId = await _controller.runJavaScriptReturningResult('''
       (function() {
         var url = window.location.href;
-        var match = url.match(/v=([\w-]+)/);
+        var match = url.match(/v=([\\w-]+)/);
         return match ? match[1] : null;
       })();
     ''');
@@ -115,7 +198,6 @@ class _WebViewPageState extends State<WebViewPage> with WidgetsBindingObserver {
         await _player!.play();
         setState(() {
           _audioPlaying = true;
-          _currentVideoId = vid;
         });
         yt.close();
       } catch (e) {
@@ -133,79 +215,14 @@ class _WebViewPageState extends State<WebViewPage> with WidgetsBindingObserver {
           children: [
             // WebView는 항상 터치 이벤트를 100% 받도록 직접 배치
             WebViewWidget(controller: _controller),
-            // 화면 중앙 1/3 영역에만 투명 더블탭 레이어 (네비게이션 버튼 표시용)
-            Positioned(
-              left: MediaQuery.of(context).size.width / 3,
-              top: MediaQuery.of(context).size.height / 3,
-              width: MediaQuery.of(context).size.width / 3,
-              height: MediaQuery.of(context).size.height / 3,
-              child: GestureDetector(
+            // 스크롤을 방해하지 않고 수평 스와이프만 감지
+            Positioned.fill(
+              child: Listener(
                 behavior: HitTestBehavior.translucent,
-                onDoubleTap: () {
-                  setState(() {
-                    _showNavButtons = true;
-                    _lastShowTime = DateTime.now();
-                  });
-                  Future.delayed(_buttonVisibleDuration, () {
-                    if (mounted && DateTime.now().difference(_lastShowTime) >= _buttonVisibleDuration) {
-                      setState(() {
-                        _showNavButtons = false;
-                      });
-                    }
-                  });
-                },
-                child: Container(),
+                onPointerDown: _onPointerDown,
+                onPointerUp: _onPointerUp,
               ),
             ),
-            if (_showNavButtons)
-              Positioned.fill(
-                child: IgnorePointer(
-                  ignoring: false,
-                  child: Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: [
-                      // < 버튼 (뒤로)
-                      Container(
-                        alignment: Alignment.centerLeft,
-                        child: GestureDetector(
-                          onTap: () async {
-                            if (await _controller.canGoBack()) _controller.goBack();
-                            setState(() => _showNavButtons = false);
-                          },
-                          child: Container(
-                            margin: const EdgeInsets.only(left: 8),
-                            padding: const EdgeInsets.symmetric(vertical: 32, horizontal: 16),
-                            decoration: BoxDecoration(
-                              color: Colors.black.withOpacity(0.3),
-                              borderRadius: BorderRadius.circular(32),
-                            ),
-                            child: const Icon(Icons.arrow_back_ios, color: Colors.white, size: 32),
-                          ),
-                        ),
-                      ),
-                      // > 버튼 (앞으로)
-                      Container(
-                        alignment: Alignment.centerRight,
-                        child: GestureDetector(
-                          onTap: () async {
-                            if (await _controller.canGoForward()) _controller.goForward();
-                            setState(() => _showNavButtons = false);
-                          },
-                          child: Container(
-                            margin: const EdgeInsets.only(right: 8),
-                            padding: const EdgeInsets.symmetric(vertical: 32, horizontal: 16),
-                            decoration: BoxDecoration(
-                              color: Colors.black.withOpacity(0.3),
-                              borderRadius: BorderRadius.circular(32),
-                            ),
-                            child: const Icon(Icons.arrow_forward_ios, color: Colors.white, size: 32),
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
             if (_audioPlaying)
               Positioned(
                 left: 0, right: 0, bottom: 24,
@@ -240,7 +257,6 @@ class _WebViewPageState extends State<WebViewPage> with WidgetsBindingObserver {
                             setState(() {
                               _audioPlaying = false;
                               _player = null;
-                              _currentVideoId = null;
                             });
                           },
                         ),

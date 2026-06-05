@@ -1,4 +1,4 @@
-
+import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:webview_flutter/webview_flutter.dart';
@@ -27,6 +27,10 @@ class _WebViewPageState extends State<WebViewPage> with WidgetsBindingObserver {
   AudioPlayer? _player;
   bool _audioLoading = false;
   bool _audioPlaying = false;
+  bool _backgroundAudioLoading = false;
+  Timer? _manifestRefreshTimer;
+  String? _backgroundVideoId;
+  MediaItem? _backgroundMediaItem;
   late final WebViewController _controller;
   static const String _jsChannelName = 'FullscreenListener';
 
@@ -150,6 +154,7 @@ class _WebViewPageState extends State<WebViewPage> with WidgetsBindingObserver {
               setInterval(function() { addFSListener(); addVideoListener(); }, 1000);
             })();
           ''');
+          await _injectPlaybackStateTracker();
         },
       ))
       ..loadRequest(Uri.parse('https://m.youtube.com'));
@@ -159,52 +164,248 @@ class _WebViewPageState extends State<WebViewPage> with WidgetsBindingObserver {
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _manifestRefreshTimer?.cancel();
+    _player?.dispose();
     super.dispose();
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    // 백그라운드 진입 시 자동 오디오 재생은 비활성화 (전체화면 버튼에서만 동작)
+    if (state == AppLifecycleState.paused ||
+        state == AppLifecycleState.hidden) {
+      _startBackgroundAudioIfNeeded();
+    }
   }
 
-  Future<void> _handleBackgroundAudio() async {
-    if (_audioLoading) return;
-    setState(() { _audioLoading = true; });
-    final videoId = await _controller.runJavaScriptReturningResult('''
+  Future<String?> _currentVideoId() async {
+    final videoId = await _controller.runJavaScriptReturningResult(r'''
       (function() {
         var url = window.location.href;
-        var match = url.match(/v=([\\w-]+)/);
+        var match = url.match(/[?&]v=([\w-]+)/);
+        if (!match) match = url.match(/\/shorts\/([\w-]+)/);
+        if (!match) match = url.match(/\/embed\/([\w-]+)/);
         return match ? match[1] : null;
       })();
     ''');
+
+    final vid = videoId.toString().replaceAll('"', '').trim();
+    if (vid.isEmpty || vid == 'null') return null;
+    return vid;
+  }
+
+  Future<double> _currentVideoPosition() async {
     final position = await _controller.runJavaScriptReturningResult('''
       (function() {
         var v = document.querySelector('video');
         return v ? v.currentTime : 0;
       })();
     ''');
-    final vid = videoId.toString().replaceAll('"', '');
-    final pos = double.tryParse(position.toString()) ?? 0;
-    if (vid.isNotEmpty && vid != 'null') {
-      try {
-        final yt = YoutubeExplode();
-        final manifest = await yt.videos.streamsClient.getManifest(vid);
-        final audio = manifest.audioOnly.withHighestBitrate();
-        final url = audio.url.toString();
-        _player?.dispose();
-        _player = AudioPlayer();
-        await _player!.setUrl(url);
-        await _player!.seek(Duration(seconds: pos.toInt()));
-        await _player!.play();
+    return double.tryParse(position.toString()) ?? 0;
+  }
+
+  Future<bool> _shouldContinueWebVideoInBackground() async {
+    final playing = await _controller.runJavaScriptReturningResult(r'''
+      (function() {
+        var v = document.querySelector('video');
+        if (!v) return false;
+
+        var now = Date.now();
+        var currentlyPlaying = !v.paused && !v.ended && v.readyState > 2;
+        var recentlyPlaying =
+          !!window.__backtubeVideoWasPlaying &&
+          !window.__backtubeVideoEnded &&
+          (now - (window.__backtubeLastPlayingAt || 0) < 8000);
+
+        return currentlyPlaying || recentlyPlaying;
+      })();
+    ''');
+    return playing.toString().replaceAll('"', '').trim() == 'true';
+  }
+
+  Future<void> _injectPlaybackStateTracker() async {
+    await _controller.runJavaScript(r"""
+(function() {
+  function markPlaying(video) {
+    window.__backtubeVideoWasPlaying = true;
+    window.__backtubeVideoEnded = false;
+    window.__backtubeLastPlayingAt = Date.now();
+    if (video) video.dataset.backtubeUserPaused = '0';
+  }
+
+  function markStopped(video) {
+    if (!video) return;
+    window.__backtubeVideoEnded = !!video.ended;
+    if (video.ended) {
+      window.__backtubeVideoWasPlaying = false;
+    }
+  }
+
+  function attach(video) {
+    if (!video || video.dataset.backtubePlaybackTracker === '1') return;
+    video.dataset.backtubePlaybackTracker = '1';
+    video.addEventListener('play', function() { markPlaying(video); }, true);
+    video.addEventListener('playing', function() { markPlaying(video); }, true);
+    video.addEventListener('timeupdate', function() {
+      if (!video.paused && !video.ended) markPlaying(video);
+    }, true);
+    video.addEventListener('pause', function() { markStopped(video); }, true);
+    video.addEventListener('ended', function() { markStopped(video); }, true);
+
+    if (!video.paused && !video.ended) markPlaying(video);
+  }
+
+  function scan() {
+    var videos = document.querySelectorAll('video');
+    for (var i = 0; i < videos.length; i++) attach(videos[i]);
+  }
+
+  scan();
+  if (!window.__backtubePlaybackTrackerObserver) {
+    window.__backtubePlaybackTrackerObserver = new MutationObserver(scan);
+    window.__backtubePlaybackTrackerObserver.observe(
+      document.documentElement || document.body,
+      { childList: true, subtree: true }
+    );
+  }
+})();
+""");
+  }
+
+  Future<void> _startBackgroundAudioIfNeeded() async {
+    if (_backgroundAudioLoading || _player?.playing == true) return;
+
+    try {
+      if (!await _shouldContinueWebVideoInBackground()) return;
+      await _handleBackgroundAudio();
+    } catch (_) {
+      // ignore
+    }
+  }
+
+  Future<void> _handleBackgroundAudio() async {
+    if (_audioLoading || _backgroundAudioLoading) return;
+    _backgroundAudioLoading = true;
+    if (mounted) {
+      setState(() {
+        _audioLoading = true;
+      });
+    }
+
+    YoutubeExplode? yt;
+    try {
+      final vid = await _currentVideoId();
+      if (vid == null) return;
+
+      final pos = await _currentVideoPosition();
+      yt = YoutubeExplode();
+      final video = await yt.videos.get(vid);
+      final manifest = await yt.videos.streamsClient.getManifest(vid);
+      final audio = manifest.audioOnly.withHighestBitrate();
+      final mediaItem = MediaItem(
+        id: vid,
+        title: video.title,
+        artist: video.author,
+        duration: video.duration,
+        artUri: Uri.parse(video.thumbnails.highResUrl),
+      );
+
+      await _player?.dispose();
+      _player = AudioPlayer();
+      _backgroundVideoId = vid;
+      _backgroundMediaItem = mediaItem;
+      await _player!.setAudioSource(
+        AudioSource.uri(audio.url, tag: mediaItem),
+        initialPosition: Duration(milliseconds: (pos * 1000).round()),
+      );
+      _scheduleManifestRefresh(audio.url);
+      await _player!.play();
+
+      if (mounted) {
         setState(() {
           _audioPlaying = true;
         });
-        yt.close();
-      } catch (e) {
-        // ignore
+      }
+
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+      if (_player != null && !_player!.playing) {
+        await _player!.play();
+      }
+      if (mounted && _player?.playing == true) {
+        setState(() {
+          _audioPlaying = true;
+        });
+      }
+    } catch (_) {
+      // ignore
+    } finally {
+      yt?.close();
+      _backgroundAudioLoading = false;
+      if (mounted) {
+        setState(() {
+          _audioLoading = false;
+        });
       }
     }
-    setState(() { _audioLoading = false; });
+  }
+
+  Duration _refreshDelayFor(Uri streamUrl) {
+    final expireSeconds =
+        int.tryParse(streamUrl.queryParameters['expire'] ?? '');
+    if (expireSeconds == null) return const Duration(minutes: 30);
+
+    final expiresAt = DateTime.fromMillisecondsSinceEpoch(
+      expireSeconds * 1000,
+      isUtc: false,
+    );
+    final delay =
+        expiresAt.difference(DateTime.now()) - const Duration(minutes: 5);
+
+    if (delay < const Duration(minutes: 5)) return const Duration(minutes: 5);
+    if (delay > const Duration(minutes: 45)) return const Duration(minutes: 45);
+    return delay;
+  }
+
+  void _scheduleManifestRefresh(Uri streamUrl) {
+    _manifestRefreshTimer?.cancel();
+    _manifestRefreshTimer = Timer(_refreshDelayFor(streamUrl), () {
+      _refreshBackgroundAudioSource();
+    });
+  }
+
+  Future<void> _refreshBackgroundAudioSource() async {
+    final player = _player;
+    final vid = _backgroundVideoId;
+    final mediaItem = _backgroundMediaItem;
+    if (player == null || vid == null || mediaItem == null) return;
+    if (_backgroundAudioLoading) return;
+
+    _backgroundAudioLoading = true;
+    YoutubeExplode? yt;
+    try {
+      final position = player.position;
+      final wasPlaying = player.playing;
+      yt = YoutubeExplode();
+      final manifest = await yt.videos.streamsClient.getManifest(vid);
+      final audio = manifest.audioOnly.withHighestBitrate();
+
+      await player.setAudioSource(
+        AudioSource.uri(audio.url, tag: mediaItem),
+        initialPosition: position,
+      );
+      _scheduleManifestRefresh(audio.url);
+
+      if (wasPlaying) {
+        await player.play();
+      }
+    } catch (_) {
+      _manifestRefreshTimer?.cancel();
+      _manifestRefreshTimer = Timer(const Duration(minutes: 5), () {
+        _refreshBackgroundAudioSource();
+      });
+    } finally {
+      yt?.close();
+      _backgroundAudioLoading = false;
+    }
   }
 
   @override
@@ -225,10 +426,13 @@ class _WebViewPageState extends State<WebViewPage> with WidgetsBindingObserver {
             ),
             if (_audioPlaying)
               Positioned(
-                left: 0, right: 0, bottom: 24,
+                left: 0,
+                right: 0,
+                bottom: 24,
                 child: Center(
                   child: Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 8),
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 24, vertical: 8),
                     decoration: BoxDecoration(
                       color: Colors.black.withOpacity(0.7),
                       borderRadius: BorderRadius.circular(32),
@@ -237,21 +441,32 @@ class _WebViewPageState extends State<WebViewPage> with WidgetsBindingObserver {
                       mainAxisSize: MainAxisSize.min,
                       children: [
                         IconButton(
-                          icon: Icon(_player?.playing == true ? Icons.pause : Icons.play_arrow, color: Colors.white),
+                          icon: Icon(
+                              _player?.playing == true
+                                  ? Icons.pause
+                                  : Icons.play_arrow,
+                              color: Colors.white),
                           onPressed: () async {
                             if (_player == null) return;
                             if (_player!.playing) {
                               await _player!.pause();
-                              setState(() { _audioPlaying = false; });
+                              setState(() {
+                                _audioPlaying = false;
+                              });
                             } else {
                               await _player!.play();
-                              setState(() { _audioPlaying = true; });
+                              setState(() {
+                                _audioPlaying = true;
+                              });
                             }
                           },
                         ),
                         IconButton(
                           icon: const Icon(Icons.close, color: Colors.white),
                           onPressed: () async {
+                            _manifestRefreshTimer?.cancel();
+                            _backgroundVideoId = null;
+                            _backgroundMediaItem = null;
                             await _player?.stop();
                             await _player?.dispose();
                             setState(() {
@@ -267,15 +482,19 @@ class _WebViewPageState extends State<WebViewPage> with WidgetsBindingObserver {
               ),
             if (_audioLoading)
               Positioned(
-                left: 0, right: 0, bottom: 80,
+                left: 0,
+                right: 0,
+                bottom: 80,
                 child: Center(
                   child: Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
                     decoration: BoxDecoration(
                       color: Colors.black.withOpacity(0.5),
                       borderRadius: BorderRadius.circular(16),
                     ),
-                    child: const Text('오디오 준비중...', style: TextStyle(color: Colors.white)),
+                    child: const Text('오디오 준비중...',
+                        style: TextStyle(color: Colors.white)),
                   ),
                 ),
               ),

@@ -40,11 +40,11 @@ class _AudioPlayerPageState extends State<AudioPlayerPage> {
         duration: video.duration,
         artUri: null, // 썸네일 대신 시스템 기본 배경 사용
       );
-      await _player.setAudioSource(
-        ConcatenatingAudioSource(children: [
+      await _player.setAudioSources(
+        [
           AudioSource.uri(Uri.parse(url), tag: mediaItem),
           AudioSource.uri(Uri.parse(url), tag: mediaItem),
-        ]),
+        ],
         initialPosition: Duration(seconds: widget.position.toInt()),
       );
       // 자동 재생 제거: 플레이 버튼을 눌러야만 재생됨

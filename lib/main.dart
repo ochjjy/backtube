@@ -9,16 +9,39 @@ import 'package:audio_session/audio_session.dart';
 import 'package:youtube_explode_dart/youtube_explode_dart.dart';
 import 'package:just_audio_background/just_audio_background.dart';
 
+import 'download_service.dart';
+import 'home_menu_page.dart';
+import 'player_service.dart';
+
 Future<void> main() async {
+  debugPrint('[BT] boot: main() entered');
   WidgetsFlutterBinding.ensureInitialized();
-  await JustAudioBackground.init(
-    androidNotificationChannelId: 'com.example.backtube.channel.audio',
-    androidNotificationChannelName: 'BackTube Audio Playback',
-    androidNotificationOngoing: true,
+  debugPrint('[BT] boot: WidgetsFlutterBinding ready');
+  // just_audio_background(내부 audio_service)는 runApp 전에 초기화가 끝나 있어야
+  // 안전하다. 실패하더라도 앱 화면은 떠야 하므로 try/catch로 감싼다.
+  try {
+    debugPrint('[BT] boot: ensureAudioReady begin');
+    await ensureAudioReady();
+    debugPrint('[BT] boot: ensureAudioReady done');
+  } catch (e, st) {
+    debugPrint('[BT] audio init failed: $e\n$st');
+  }
+  debugPrint('[BT] boot: runApp');
+  runApp(
+    MaterialApp(
+      debugShowCheckedModeBanner: false,
+      themeMode: ThemeMode.dark,
+      darkTheme: ThemeData(
+        useMaterial3: true,
+        brightness: Brightness.dark,
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: const Color(0xFFFF0033),
+          brightness: Brightness.dark,
+        ),
+      ),
+      home: const HomeMenuPage(),
+    ),
   );
-  final session = await AudioSession.instance;
-  await session.configure(const AudioSessionConfiguration.music());
-  runApp(const MaterialApp(home: WebViewPage()));
 }
 
 class WebViewPage extends StatefulWidget {
@@ -36,8 +59,15 @@ class _WebViewPageState extends State<WebViewPage> with WidgetsBindingObserver {
   bool _backgroundAudioPrepared = false;
   bool _isInBackground = false;
   bool _playWhenPrepared = false;
+  // 프리페어가 실패한 영상 id. 봇 차단/재생 불가 영상을 3초마다 반복 시도해
+  // AVPlayer XPC를 계속 크래시시키지 않도록, 같은 영상은 한 번만 시도한다.
+  String? _failedPrepareVideoId;
   bool _lastKnownWebVideoWasPlaying = false;
   Duration _lastKnownWebPosition = Duration.zero;
+  // 웹 플레이어에서 사용자가 고른 배속(예: 1.5x). 백그라운드 오디오는 웹 영상이
+  // 아니라 별도 _player로 재생되므로, 이 값을 setSpeed로 넘겨주지 않으면
+  // 항상 1.0배속으로 떨어진다.
+  double _lastKnownWebPlaybackRate = 1.0;
   Timer? _foregroundPrepareTimer;
   Timer? _manifestRefreshTimer;
   StreamSubscription<PlayerState>? _playerStateSubscription;
@@ -167,26 +197,20 @@ class _WebViewPageState extends State<WebViewPage> with WidgetsBindingObserver {
   void initState() {
     super.initState();
     // just_audio_background는 단일 플레이어 인스턴스를 전제로 하므로
-    // 앱 생명주기 동안 하나만 만들어 재사용한다. 버퍼를 넉넉히 잡아
-    // 백그라운드 네트워크 흔들림에도 재생이 끊기지 않게 한다.
-    _player = AudioPlayer(
-      audioLoadConfiguration: const AudioLoadConfiguration(
-        androidLoadControl: AndroidLoadControl(
-          minBufferDuration: Duration(seconds: 60),
-          maxBufferDuration: Duration(minutes: 3),
-          bufferForPlaybackDuration: Duration(milliseconds: 500),
-          bufferForPlaybackAfterRebufferDuration: Duration(seconds: 3),
-        ),
-        darwinLoadControl: DarwinLoadControl(
-          preferredForwardBufferDuration: Duration(seconds: 60),
-        ),
-      ),
-    );
+    // 앱 전역 공유 인스턴스(btPlayer)를 재사용한다. 메뉴에서 이 화면을
+    // 오갈 때마다 새로 만들면 iOS 오디오 세션/알림 바인딩이 끊긴다.
+    _player = btPlayer;
     _attachPlayerDebugLogs(_player);
     _setupAudioSessionHandlers();
     _controller = WebViewController()
       ..setJavaScriptMode(JavaScriptMode.unrestricted)
       ..addJavaScriptChannel(_jsChannelName, onMessageReceived: (msg) async {
+        // 유튜브 "공유" 클릭 → 오디오 저장 메뉴.
+        if (msg.message.startsWith('share:')) {
+          final sharedUrl = msg.message.substring('share:'.length);
+          await _handleShareSaveRequest(sharedUrl);
+          return;
+        }
         // 포그라운드에서 웹 영상이 다시 재생되면 오디오를 넘겨준다(이중 재생 방지).
         if ((msg.message == 'video_play' || msg.message == 'video_playing') &&
             !_isInBackground &&
@@ -233,6 +257,7 @@ class _WebViewPageState extends State<WebViewPage> with WidgetsBindingObserver {
             })();
           ''');
           await _injectPlaybackStateTracker();
+          await _injectShareInterceptor();
         },
       ))
       ..loadRequest(Uri.parse('https://m.youtube.com'));
@@ -252,7 +277,8 @@ class _WebViewPageState extends State<WebViewPage> with WidgetsBindingObserver {
     _playbackEventSubscription?.cancel();
     _interruptionSubscription?.cancel();
     _becomingNoisySubscription?.cancel();
-    _player.dispose();
+    // _player(btPlayer)는 앱 전역 공유 인스턴스라 여기서 dispose 하지 않는다.
+    // (메뉴로 돌아가도 백그라운드 재생/알림이 유지되어야 한다.)
     super.dispose();
   }
 
@@ -336,10 +362,14 @@ class _WebViewPageState extends State<WebViewPage> with WidgetsBindingObserver {
         }
       } else if (_player.playing) {
         final seconds = _player.position.inMilliseconds / 1000.0;
+        final rate = _lastKnownWebPlaybackRate;
         await _controller.runJavaScript('''
           (function() {
             var v = document.querySelector('video');
-            if (v) { try { v.currentTime = $seconds; } catch (e) {} }
+            if (v) {
+              try { v.currentTime = $seconds; } catch (e) {}
+              try { v.playbackRate = $rate; } catch (e) {}
+            }
           })();
         ''');
       }
@@ -407,6 +437,29 @@ class _WebViewPageState extends State<WebViewPage> with WidgetsBindingObserver {
       })();
     ''');
     return double.tryParse(position.toString()) ?? 0;
+  }
+
+  Future<double> _currentVideoPlaybackRate() async {
+    final rate = await _controller.runJavaScriptReturningResult('''
+      (function() {
+        var v = document.querySelector('video');
+        return v ? v.playbackRate : 1;
+      })();
+    ''');
+    return double.tryParse(rate.toString()) ?? 1.0;
+  }
+
+  /// 백그라운드 오디오(_player)의 배속을 웹 플레이어에서 고른 값에 맞춘다.
+  Future<void> _applyBackgroundPlaybackSpeed() async {
+    final rate = _lastKnownWebPlaybackRate;
+    if (rate <= 0) return;
+    if ((_player.speed - rate).abs() < 0.01) return;
+    try {
+      await _player.setSpeed(rate);
+      _btLog('applied background speed=$rate');
+    } catch (e) {
+      _btLog('setSpeed error: $e');
+    }
   }
 
   Future<bool> _shouldContinueWebVideoInBackground() async {
@@ -477,6 +530,190 @@ class _WebViewPageState extends State<WebViewPage> with WidgetsBindingObserver {
 """);
   }
 
+  /// 유튜브 공유 동작을 가로채 Flutter로 알린다.
+  /// (1) Web Share API(navigator.share) 오버라이드 — iOS 유튜브 공유의 주 경로.
+  /// (2) '공유'/'share' 버튼 클릭 감지 — navigator.share를 안 쓰는 경우 대비.
+  Future<void> _injectShareInterceptor() async {
+    await _controller.runJavaScript(r"""
+(function() {
+  if (window.__btShareHooked) return;
+  window.__btShareHooked = true;
+
+  function postShare(url) {
+    try {
+      var now = Date.now();
+      if (window.__btLastShareAt && (now - window.__btLastShareAt) < 1500) return;
+      window.__btLastShareAt = now;
+      FullscreenListener.postMessage('share:' + (url || window.location.href));
+    } catch (e) {}
+  }
+
+  try {
+    navigator.share = function(data) {
+      var u = (data && (data.url || data.text)) || window.location.href;
+      postShare(u);
+      return Promise.resolve();
+    };
+  } catch (e) {}
+
+  document.addEventListener('click', function(e) {
+    try {
+      var el = (e.target && e.target.closest)
+        ? e.target.closest('[aria-label], button, a')
+        : null;
+      if (!el) return;
+      var label = (el.getAttribute('aria-label') || el.textContent || '')
+        .toLowerCase();
+      if (label.indexOf('공유') >= 0 || label.indexOf('share') >= 0) {
+        postShare(window.location.href);
+      }
+    } catch (e) {}
+  }, true);
+})();
+""");
+  }
+
+  String? _extractVideoIdFromUrl(String url) {
+    final patterns = <RegExp>[
+      RegExp(r'youtu\.be/([\w-]{6,})'),
+      RegExp(r'[?&]v=([\w-]{6,})'),
+      RegExp(r'/shorts/([\w-]{6,})'),
+      RegExp(r'/embed/([\w-]{6,})'),
+    ];
+    for (final p in patterns) {
+      final m = p.firstMatch(url);
+      if (m != null) return m.group(1);
+    }
+    return null;
+  }
+
+  Future<void> _handleShareSaveRequest(String sharedUrl) async {
+    _btLog('share intent url=$sharedUrl');
+    // 공유 URL에서 videoId 우선 파싱, 없으면 현재 재생 중인 영상 id.
+    var videoId = _extractVideoIdFromUrl(sharedUrl);
+    videoId ??= await _safeCurrentVideoId();
+    if (!mounted) return;
+    if (videoId == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('영상을 찾을 수 없습니다.')),
+      );
+      return;
+    }
+    _showSaveSheet(videoId);
+  }
+
+  void _showSaveSheet(String videoId) {
+    showModalBottomSheet<void>(
+      context: context,
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Padding(
+              padding: EdgeInsets.fromLTRB(16, 16, 16, 8),
+              child: Text('이 영상을',
+                  style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+            ),
+            ListTile(
+              leading: const Icon(Icons.audiotrack),
+              title: const Text('오디오로 저장 (m4a)'),
+              subtitle: const Text('저장파일 메뉴에서 백그라운드 재생'),
+              onTap: () {
+                Navigator.pop(ctx);
+                _startDownload(videoId);
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.close),
+              title: const Text('취소'),
+              onTap: () => Navigator.pop(ctx),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _startDownload(String videoId) async {
+    if (await DownloadService.isSaved(videoId)) {
+      if (!mounted) return;
+      final overwrite = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('이미 저장됨'),
+          content: const Text('이 영상은 이미 저장되어 있습니다. 다시 저장할까요?'),
+          actions: [
+            TextButton(
+                onPressed: () => Navigator.pop(ctx, false),
+                child: const Text('취소')),
+            TextButton(
+                onPressed: () => Navigator.pop(ctx, true),
+                child: const Text('다시 저장')),
+          ],
+        ),
+      );
+      if (overwrite != true) return;
+    }
+
+    // 전체 크기를 모르는 스트림도 있어 progress는 nullable(불확정) + 받은 용량 표시.
+    final progress = ValueNotifier<double?>(null);
+    final label = ValueNotifier<String>('준비 중...');
+    if (mounted) {
+      showDialog<void>(
+        context: context,
+        barrierDismissible: false,
+        builder: (ctx) => AlertDialog(
+          title: const Text('오디오 저장 중...'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              ValueListenableBuilder<double?>(
+                valueListenable: progress,
+                builder: (_, v, __) => LinearProgressIndicator(value: v),
+              ),
+              const SizedBox(height: 12),
+              ValueListenableBuilder<String>(
+                valueListenable: label,
+                builder: (_, v, __) => Text(v),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
+    try {
+      final saved = await DownloadService.saveAudio(
+        videoId,
+        onBytes: (received, total) {
+          progress.value = total > 0 ? received / total : null;
+          label.value = total > 0
+              ? '${_fmtMb(received)} / ${_fmtMb(total)} MB'
+              : '${_fmtMb(received)} MB 받는 중...';
+        },
+      ).timeout(const Duration(minutes: 5));
+      if (mounted) {
+        Navigator.of(context, rootNavigator: true).pop();
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('저장 완료: ${saved.title}')),
+        );
+      }
+    } catch (e) {
+      _btLog('save audio error: $e');
+      if (mounted) {
+        Navigator.of(context, rootNavigator: true).pop();
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('저장 실패: $e')),
+        );
+      }
+    } finally {
+      progress.dispose();
+      label.dispose();
+    }
+  }
+
+  String _fmtMb(int bytes) => (bytes / (1024 * 1024)).toStringAsFixed(1);
+
   Future<void> _startBackgroundAudioIfNeeded({
     bool allowWebViewProbe = false,
   }) async {
@@ -531,6 +768,7 @@ class _WebViewPageState extends State<WebViewPage> with WidgetsBindingObserver {
           _backgroundVideoId == _lastKnownWebVideoId) {
         _btLog('using prepared player; seek=$position then play');
         await _player.seek(position);
+        await _applyBackgroundPlaybackSpeed();
         await _activateAudioSession();
         await _player.play();
         unawaited(_pauseWebVideo());
@@ -581,8 +819,10 @@ class _WebViewPageState extends State<WebViewPage> with WidgetsBindingObserver {
     try {
       final seconds = await _currentVideoPosition();
       _lastKnownWebPosition = Duration(milliseconds: (seconds * 1000).round());
+      final rate = await _currentVideoPlaybackRate();
+      if (rate > 0) _lastKnownWebPlaybackRate = rate;
     } catch (_) {
-      // Keep the last known foreground position.
+      // Keep the last known foreground position/speed.
     }
     return _lastKnownWebPosition;
   }
@@ -601,6 +841,11 @@ class _WebViewPageState extends State<WebViewPage> with WidgetsBindingObserver {
       final vid = await _safeCurrentVideoId();
       if (vid == null) {
         _btLog('foreground prepare skipped: video id is null');
+        return;
+      }
+
+      if (vid == _failedPrepareVideoId) {
+        _btLog('foreground prepare skipped: video previously failed ($vid)');
         return;
       }
 
@@ -634,7 +879,8 @@ class _WebViewPageState extends State<WebViewPage> with WidgetsBindingObserver {
     try {
       _btLog(
         'prepareBackgroundAudio start '
-        'videoId=$videoId position=$position playAfterPrepare=$playAfterPrepare',
+        'videoId=$videoId position=$position playAfterPrepare=$playAfterPrepare '
+        'isInBackground=$_isInBackground playWhenPrepared=$_playWhenPrepared',
       );
       yt = YoutubeExplode();
       final video = await yt.videos.get(videoId);
@@ -660,6 +906,13 @@ class _WebViewPageState extends State<WebViewPage> with WidgetsBindingObserver {
       );
       if (!loaded) {
         _btLog('prepareBackgroundAudio: all stream candidates failed');
+        // 실패한 로드로 플레이어가 broken/playing 상태로 남아 이후 저장파일
+        // 재생을 방해하지 않도록 깨끗이 정지시킨다.
+        try {
+          await _player.stop();
+        } catch (_) {}
+        // 봇 차단/재생 불가 영상은 3초 타이머로 반복 시도하지 않는다.
+        _failedPrepareVideoId = videoId;
         if (_isInBackground) {
           unawaited(_endIosBackgroundGrace());
         }
@@ -670,6 +923,7 @@ class _WebViewPageState extends State<WebViewPage> with WidgetsBindingObserver {
         'processing=${_player.processingState}',
       );
       _backgroundAudioPrepared = true;
+      _failedPrepareVideoId = null;
 
       // 백그라운드일 때만 자동 재생한다. 로딩 중에 포그라운드로 복귀했다면
       // 웹 영상이 다시 재생될 수 있으므로 여기서 소리를 내면 이중 재생이 된다.
@@ -691,6 +945,7 @@ class _WebViewPageState extends State<WebViewPage> with WidgetsBindingObserver {
       }
 
       _btLog('play prepared audio start position=$startPosition');
+      await _applyBackgroundPlaybackSpeed();
       // iOS: 백그라운드 전환 중에는 재생 시작 전에 오디오 세션을 먼저
       // 활성화해야 앱이 suspend 되지 않고 재생이 이어진다.
       await _activateAudioSession();
@@ -742,46 +997,100 @@ class _WebViewPageState extends State<WebViewPage> with WidgetsBindingObserver {
       ('default', null),
     ];
 
+    // 백그라운드에서 AVPlayer가 미디어를 로드/디코드하려면 오디오 세션이
+    // 먼저 활성화돼 있어야 한다. 세션이 죽어 있으면 setAudioSource가
+    // -11800/-11819로 실패한다.
+    if (_isInBackground) {
+      _btLog('loadPlayableAudio: activating session before load (background)');
+      await _activateAudioSession();
+    }
+
     for (final (label, clients) in attempts) {
+      final StreamManifest manifest;
       try {
-        final manifest = clients == null
+        manifest = clients == null
             ? await yt.videos.streamsClient.getManifest(videoId)
             : await yt.videos.streamsClient
                 .getManifest(videoId, ytClients: clients);
-        final audio = _selectIosPlayableAudio(manifest);
-        _btLog(
-          'candidate[$label] container=${audio.container} '
-          'codec=${audio.audioCodec} bitrate=${audio.bitrate}',
-        );
-        await _player.setAudioSource(
-          AudioSource.uri(audio.url, tag: mediaItem),
-          initialPosition: position,
-        );
-        _btLog('candidate[$label] loaded ok');
-        _scheduleManifestRefresh(audio.url);
-        return true;
-      } on PlayerInterruptedException {
-        // 더 새로운 로드가 시작된 것이므로 이 시도는 조용히 중단한다.
-        _btLog('candidate[$label] interrupted by newer load');
-        return false;
       } catch (e) {
-        _btLog('candidate[$label] failed: $e');
+        _btLog('candidate[$label] manifest failed: $e');
+        continue;
+      }
+
+      final candidates = _orderedAudioCandidates(manifest);
+      _btLog(
+        'candidate[$label] manifest ok; audio streams='
+        '${candidates.map((s) => '${s.container.name}/${s.audioCodec}'
+            '@${s.bitrate.kiloBitsPerSecond.round()}k').join(', ')}',
+      );
+
+      for (var i = 0; i < candidates.length; i++) {
+        final audio = candidates[i];
+        final expire = audio.url.queryParameters['expire'] ?? '?';
+        _btLog(
+          'try[$label#$i] container=${audio.container} '
+          'codec=${audio.audioCodec} bitrate=${audio.bitrate} '
+          'host=${audio.url.host} expire=$expire background=$_isInBackground',
+        );
+        try {
+          final loadedDuration = await _player.setAudioSource(
+            AudioSource.uri(audio.url, tag: mediaItem),
+            initialPosition: position,
+          );
+          // setAudioSource가 예외 없이 끝나도 iOS에서 duration이 비거나 0이면
+          // 실제로는 재생 불가한 URL이다(로그의 ready→idle 패턴). 다음 후보로.
+          if (loadedDuration == null || loadedDuration == Duration.zero) {
+            _btLog(
+              'try[$label#$i] loaded but duration=$loadedDuration; '
+              'treat as unplayable, next candidate',
+            );
+            continue;
+          }
+          _btLog('try[$label#$i] loaded ok duration=$loadedDuration');
+          _scheduleManifestRefresh(audio.url);
+          return true;
+        } on PlayerInterruptedException {
+          // 더 새로운 로드가 시작된 것이므로 이 시도는 조용히 중단한다.
+          _btLog('try[$label#$i] interrupted by newer load');
+          return false;
+        } catch (e) {
+          _btLog(
+            'try[$label#$i] failed: $e '
+            '(processing=${_player.processingState})',
+          );
+          // 실패한 로드는 AVPlayer 내부 상태(특히 XPC 파이프라인)를 흔들어
+          // 놓을 수 있어, 다음 후보 로드가 연쇄 실패(-11819)한다. stop으로
+          // 플레이어를 idle로 되돌려 다음 시도가 깨끗한 상태에서 시작하게 한다.
+          try {
+            await _player.stop();
+          } catch (_) {}
+        }
       }
     }
     return false;
   }
 
-  AudioOnlyStreamInfo _selectIosPlayableAudio(StreamManifest manifest) {
-    final mp4Audio = manifest.audioOnly
-        .where((stream) => stream.container == StreamContainer.mp4);
-    if (mp4Audio.isNotEmpty) {
-      final selected = mp4Audio.withHighestBitrate();
-      _btLog(
-          'audio candidates mp4=${mp4Audio.length} all=${manifest.audioOnly.length}');
-      return selected;
-    }
-    _btLog('audio candidates no mp4; all=${manifest.audioOnly.length}');
-    return manifest.audioOnly.withHighestBitrate();
+  /// 오디오 후보를 재생 우선순위대로 정렬한다. mp4(AAC)를 고비트레이트부터.
+  /// iOS AVPlayer는 webm/opus를 재생하지 못하므로(무조건 -11828 실패 + XPC
+  /// 크래시 유발) iOS에서는 mp4만 후보로 둔다. Android(ExoPlayer)는 opus도 재생
+  /// 가능하므로 폴백으로 유지한다.
+  List<AudioOnlyStreamInfo> _orderedAudioCandidates(StreamManifest manifest) {
+    int byBitrateDesc(AudioOnlyStreamInfo a, AudioOnlyStreamInfo b) =>
+        b.bitrate.bitsPerSecond.compareTo(a.bitrate.bitsPerSecond);
+
+    final all = manifest.audioOnly.toList();
+    final mp4 = all
+        .where((s) => s.container == StreamContainer.mp4)
+        .toList()
+      ..sort(byBitrateDesc);
+    final others = all
+        .where((s) => s.container != StreamContainer.mp4)
+        .toList()
+      ..sort(byBitrateDesc);
+    _btLog('orderedAudioCandidates mp4=${mp4.length} other=${others.length} '
+        'iOS=${Platform.isIOS}');
+    if (Platform.isIOS) return mp4;
+    return [...mp4, ...others];
   }
 
   Duration _refreshDelayFor(Uri streamUrl) {
@@ -832,6 +1141,8 @@ class _WebViewPageState extends State<WebViewPage> with WidgetsBindingObserver {
         throw Exception('refresh: all stream candidates failed');
       }
 
+      // 소스 교체 후에도 배속이 유지되도록 다시 적용한다.
+      await _applyBackgroundPlaybackSpeed();
       if (wasPlaying) {
         await _player.play();
       }

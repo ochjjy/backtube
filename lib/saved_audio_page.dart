@@ -470,7 +470,7 @@ class _SavedAudioPageState extends State<SavedAudioPage> {
   }
 
   Widget _buildFolderTile(String name) {
-    return DragTarget<SavedAudio>(
+    final target = DragTarget<SavedAudio>(
       onWillAcceptWithDetails: (_) => true,
       onAcceptWithDetails: (d) => _moveTo(d.data, name),
       builder: (context, candidate, rejected) {
@@ -489,6 +489,62 @@ class _SavedAudioPageState extends State<SavedAudioPage> {
         );
       },
     );
+
+    // 좌로 슬라이드 → 폴더 삭제. 파일이 있으면 확인 메시지를 띄운다.
+    return Dismissible(
+      key: ValueKey('folder:$name'),
+      direction: DismissDirection.endToStart,
+      background: Container(
+        color: Colors.red.shade700,
+        alignment: Alignment.centerRight,
+        padding: const EdgeInsets.only(right: 24),
+        child: const Icon(Icons.delete, color: Colors.white),
+      ),
+      confirmDismiss: (_) => _confirmDeleteFolder(name),
+      onDismissed: (_) => _deleteFolder(name),
+      child: target,
+    );
+  }
+
+  Future<bool> _confirmDeleteFolder(String name) async {
+    final count = await DownloadService.folderFileCount(name);
+    if (!mounted) return false;
+    final msg = count > 0
+        ? '"$name" 폴더에 파일 $count개가 있습니다. 모두 삭제할까요?'
+        : '"$name" 폴더를 삭제할까요?';
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('폴더 삭제'),
+        content: Text(msg),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('취소')),
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('삭제')),
+        ],
+      ),
+    );
+    return ok == true;
+  }
+
+  Future<void> _deleteFolder(String name) async {
+    // Dismissible 요구: 애니메이션 후 트리에서 즉시 제거.
+    setState(() => _folders.remove(name));
+    // 이 폴더의 곡이 재생 중이면 정지(삭제된 파일을 가리키지 않게).
+    try {
+      final items = await DownloadService.list(folder: name);
+      if (_currentVideoId != null &&
+          items.any((i) => i.videoId == _currentVideoId)) {
+        await btPlayer.stop();
+        _currentVideoId = null;
+      }
+    } catch (_) {}
+    await DownloadService.deleteFolder(name);
+    _snack('"$name" 폴더를 삭제했습니다');
+    await _load();
   }
 
   Widget _buildFileTile(SavedAudio item) {

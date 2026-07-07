@@ -90,6 +90,25 @@ class DownloadService {
     return result;
   }
 
+  /// 폴더 안의 오디오(.m4a) 파일 개수.
+  static Future<int> folderFileCount(String folder) async {
+    final dir = await _folderDir(folder);
+    var n = 0;
+    await for (final e in dir.list()) {
+      if (e is File && e.path.endsWith('.m4a')) n++;
+    }
+    return n;
+  }
+
+  /// 폴더와 그 안의 모든 파일을 삭제한다.
+  static Future<void> deleteFolder(String folder) async {
+    final root = await _dir();
+    final dir = Directory('${root.path}/$folder');
+    if (await dir.exists()) {
+      await dir.delete(recursive: true);
+    }
+  }
+
   /// videoId의 m4a/json/jpg를 from 폴더에서 to 폴더로 이동한다.
   static Future<void> move(
     String videoId, {

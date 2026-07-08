@@ -7,6 +7,7 @@ import 'package:just_audio/just_audio.dart';
 import 'package:just_audio_background/just_audio_background.dart';
 
 import 'download_service.dart';
+import 'player_screen.dart';
 import 'player_service.dart';
 
 /// 기기에 저장된 오디오 목록을 보여주고 백그라운드 재생한다.
@@ -35,9 +36,16 @@ class _SavedAudioPageState extends State<SavedAudioPage> {
   @override
   void initState() {
     super.initState();
+    debugPrint('[BT] screen: SavedAudioPage 진입');
     // 저장파일 재생 중이면(예: 이 화면을 떠났다 돌아온 경우) 현재 곡을 표시한다.
-    final tag = btPlayer.sequenceState.currentSource?.tag;
-    if (tag is MediaItem) _currentVideoId = tag.id;
+    // 단, 유튜브 웹이 백그라운드용으로 준비만 해 둔 소스는 저장곡이 아니므로
+    // 무시한다. 안 그러면 방금 보던 영상을 그대로 저장한 경우 videoId가 겹쳐,
+    // 파일을 탭했을 때 _play(파일 로드)가 아니라 남은 웹 소스 토글로 새어 나가
+    // 저장 파일이 재생되지 않는다.
+    if (btPlaybackOrigin == BtPlaybackOrigin.saved) {
+      final tag = btPlayer.sequenceState.currentSource?.tag;
+      if (tag is MediaItem) _currentVideoId = tag.id;
+    }
     _speed = btPlayer.speed;
     _loopMode = btPlayer.loopMode;
     _playerStateSub = btPlayer.playerStateStream.listen((_) {
@@ -59,6 +67,7 @@ class _SavedAudioPageState extends State<SavedAudioPage> {
 
   @override
   void dispose() {
+    debugPrint('[BT] screen: SavedAudioPage 이탈');
     _playerStateSub?.cancel();
     _indexSub?.cancel();
     // btPlayer는 공유 인스턴스이므로 dispose 하지 않는다.
@@ -197,22 +206,25 @@ class _SavedAudioPageState extends State<SavedAudioPage> {
 
   /// 한 곡을 just_audio 소스로 변환한다. 잠금화면 태그(제목/아트워크)와
   /// 2× duration 보정(ClippingAudioSource)을 포함한다.
-  AudioSource _sourceFor(SavedAudio item) {
+  /// 저장곡 → 잠금화면/재생화면 표시용 MediaItem.
+  MediaItem _mediaItemFor(SavedAudio item) {
     Uri? artUri;
     if (item.thumbPath != null) {
       artUri = Uri.file(item.thumbPath!);
     } else if (item.thumbUrl != null && item.thumbUrl!.isNotEmpty) {
       artUri = Uri.parse(item.thumbUrl!);
     }
-
-    final mediaItem = MediaItem(
+    return MediaItem(
       id: item.videoId,
       title: item.title,
       artist: item.author.isEmpty ? 'BackTube' : item.author,
       duration: item.duration,
       artUri: artUri,
     );
+  }
 
+  AudioSource _sourceFor(SavedAudio item) {
+    final mediaItem = _mediaItemFor(item);
     // 유튜브 androidVr 오디오 스트림은 컨테이너 duration이 실제의 2배로 들어와
     // AVPlayer가 2배 길이로 표시한다. 실제 길이만큼 잘라 잠금화면 길이를 바로잡는다.
     return (item.duration != null && item.duration! > Duration.zero)
@@ -228,13 +240,20 @@ class _SavedAudioPageState extends State<SavedAudioPage> {
   /// 짧은 지연 후에도 재생이 안 걸렸으면 세션 재활성화 후 1회 재시도.
   /// (유튜브 재생 실패 잔해로 AVPlayer가 복구 중일 때 대비)
   Future<void> _playWithRetry(AudioSession session) async {
+    btPlayIntent = true;
     await btPlayer.setSpeed(_speed);
     await btPlayer.play();
     await Future<void>.delayed(const Duration(milliseconds: 400));
     if (!btPlayer.playing) {
+      // 그 사이 사용자가 일시정지를 눌렀다면(의도=정지) 재시도하지 않는다.
+      // 안 그러면 자동 재시도가 사용자의 일시정지를 덮어써 다시 재생된다.
+      if (!btPlayIntent) {
+        debugPrint('[BT] saved play: 사용자 일시정지 감지 → 재시도 안 함');
+        return;
+      }
       debugPrint('[BT] saved play retry (player not started)');
       await session.setActive(true);
-      await btPlayer.play();
+      if (btPlayIntent) await btPlayer.play();
     }
   }
 
@@ -254,6 +273,7 @@ class _SavedAudioPageState extends State<SavedAudioPage> {
       await btPlayer.setShuffleModeEnabled(false);
       await btPlayer.setLoopMode(_loopMode);
       await btPlayer.setAudioSource(_sourceFor(item));
+      btPlaybackOrigin = BtPlaybackOrigin.saved;
       debugPrint('[BT] saved loaded: id=${item.videoId} '
           'playerDuration=${btPlayer.duration} metaDuration=${item.duration}');
       setState(() => _currentVideoId = item.videoId);
@@ -268,13 +288,15 @@ class _SavedAudioPageState extends State<SavedAudioPage> {
   /// 잠금화면에도 이전/다음 버튼이 표시된다.
   Future<void> _playAll({required bool shuffle}) async {
     if (_items.isEmpty) return;
+    final startIndex =
+        (shuffle && _items.length > 1) ? Random().nextInt(_items.length) : 0;
+    // 재생 화면을 먼저 띄운다(랜덤은 시작곡을 알 수 없어 힌트 생략).
+    _openPlayer(initial: shuffle ? null : _mediaItemFor(_items[startIndex]));
     try {
       final session = await AudioSession.instance;
       await session.setActive(true);
 
       final sources = _items.map(_sourceFor).toList();
-      final startIndex =
-          (shuffle && sources.length > 1) ? Random().nextInt(sources.length) : 0;
       debugPrint('[BT] playAll shuffle=$shuffle count=${sources.length} '
           'start=$startIndex folder=$_currentFolder');
 
@@ -282,6 +304,7 @@ class _SavedAudioPageState extends State<SavedAudioPage> {
       await btPlayer.setLoopMode(_loopMode);
       await btPlayer.setShuffleModeEnabled(shuffle);
       await btPlayer.setAudioSources(sources, initialIndex: startIndex);
+      btPlaybackOrigin = BtPlaybackOrigin.saved;
       if (shuffle) await btPlayer.shuffle();
       _syncCurrentFromPlayer();
       await _playWithRetry(session);
@@ -290,16 +313,55 @@ class _SavedAudioPageState extends State<SavedAudioPage> {
     }
   }
 
-  Future<void> _togglePlayPause(SavedAudio item) async {
-    if (_currentVideoId == item.videoId) {
-      if (btPlayer.playing) {
-        await btPlayer.pause();
-      } else {
-        await btPlayer.play();
-      }
-      setState(() {});
+  void _openPlayer({MediaItem? initial}) {
+    debugPrint('[BT] nav: SavedAudioPage → PlayerScreen (곡="${initial?.title}")');
+    Navigator.of(context).push(
+      MaterialPageRoute(builder: (_) => PlayerScreen(initialMedia: initial)),
+    );
+  }
+
+  /// 파일 탭: 재생 화면을 즉시 띄우고 재생은 화면 뒤에서 시작한다(탭 즉시 전환).
+  /// 다른 곡이면 현재 목록을 큐로 만들어(이전/다음 동작) 그 곡부터 재생한다.
+  void _onTapItem(SavedAudio item) {
+    debugPrint('[BT] tap: 곡 클릭 id=${item.videoId} title="${item.title}" '
+        'currentId=$_currentVideoId');
+    if (_currentVideoId != item.videoId) {
+      debugPrint('[BT] tap: 새 곡 → _playFrom 시작');
+      unawaited(_playFrom(item));
     } else {
+      debugPrint('[BT] tap: 이미 현재 곡 → 재생화면만 열기');
+    }
+    _openPlayer(initial: _mediaItemFor(item));
+  }
+
+  /// 현재 목록(_items)을 큐로 만들고 [item]부터 순차 재생한다.
+  Future<void> _playFrom(SavedAudio item) async {
+    final startIndex = _items.indexWhere((i) => i.videoId == item.videoId);
+    debugPrint('[BT] playFrom: id=${item.videoId} index=$startIndex '
+        'count=${_items.length} folder=$_currentFolder');
+    if (startIndex < 0) {
+      debugPrint('[BT] playFrom: index<0 → 단일재생(_play)');
       await _play(item);
+      return;
+    }
+    try {
+      final session = await AudioSession.instance;
+      await session.setActive(true);
+
+      final sources = _items.map(_sourceFor).toList();
+      await btPlayer.stop();
+      await btPlayer.setShuffleModeEnabled(false);
+      await btPlayer.setLoopMode(_loopMode);
+      await btPlayer.setAudioSources(sources, initialIndex: startIndex);
+      btPlaybackOrigin = BtPlaybackOrigin.saved;
+      setState(() => _currentVideoId = item.videoId);
+      debugPrint('[BT] playFrom: setAudioSources 완료 → 재생 시도');
+      await _playWithRetry(session);
+      debugPrint('[BT] playFrom: 재생 상태 playing=${btPlayer.playing} '
+          'dur=${btPlayer.duration}');
+    } catch (e) {
+      debugPrint('[BT] playFrom 실패: $e');
+      _snack('재생 실패: $e');
     }
   }
 
@@ -568,7 +630,7 @@ class _SavedAudioPageState extends State<SavedAudioPage> {
           if (item.duration != null) _formatDuration(item.duration),
         ].join(' · '),
       ),
-      onTap: () => _togglePlayPause(item),
+      onTap: () => _onTapItem(item),
       trailing: IconButton(
         icon: const Icon(Icons.delete_outline),
         onPressed: () => _confirmDelete(item),

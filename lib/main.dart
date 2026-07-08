@@ -59,6 +59,10 @@ class _WebViewPageState extends State<WebViewPage> with WidgetsBindingObserver {
   bool _backgroundAudioPrepared = false;
   bool _isInBackground = false;
   bool _playWhenPrepared = false;
+  // 이 화면이 dispose된 뒤에도, 진행 중이던 유튜브 오디오 준비 작업이
+  // 뒤늦게 공유 btPlayer를 건드려(setAudioSource/stop) 저장파일 재생을
+  // 덮어쓰거나 정지시키지 않도록 하는 플래그.
+  bool _disposed = false;
   // 프리페어가 실패한 영상 id. 봇 차단/재생 불가 영상을 3초마다 반복 시도해
   // AVPlayer XPC를 계속 크래시시키지 않도록, 같은 영상은 한 번만 시도한다.
   String? _failedPrepareVideoId;
@@ -270,6 +274,7 @@ class _WebViewPageState extends State<WebViewPage> with WidgetsBindingObserver {
 
   @override
   void dispose() {
+    _disposed = true;
     WidgetsBinding.instance.removeObserver(this);
     _foregroundPrepareTimer?.cancel();
     _manifestRefreshTimer?.cancel();
@@ -717,6 +722,7 @@ class _WebViewPageState extends State<WebViewPage> with WidgetsBindingObserver {
   Future<void> _startBackgroundAudioIfNeeded({
     bool allowWebViewProbe = false,
   }) async {
+    if (_disposed) return;
     _btLog(
       'startBackgroundAudioIfNeeded '
       'allowWebViewProbe=$allowWebViewProbe '
@@ -789,7 +795,7 @@ class _WebViewPageState extends State<WebViewPage> with WidgetsBindingObserver {
   }
 
   Future<void> _handleBackgroundAudio({bool playAfterPrepare = true}) async {
-    if (_audioLoading || _backgroundAudioLoading) return;
+    if (_disposed || _audioLoading || _backgroundAudioLoading) return;
     if (mounted) {
       setState(() {
         _audioLoading = true;
@@ -828,7 +834,7 @@ class _WebViewPageState extends State<WebViewPage> with WidgetsBindingObserver {
   }
 
   Future<void> _prepareBackgroundAudioWhileForeground() async {
-    if (_isInBackground || _backgroundAudioLoading) return;
+    if (_disposed || _isInBackground || _backgroundAudioLoading) return;
 
     try {
       _lastKnownWebVideoWasPlaying =
@@ -872,7 +878,7 @@ class _WebViewPageState extends State<WebViewPage> with WidgetsBindingObserver {
     required Duration position,
     required bool playAfterPrepare,
   }) async {
-    if (_backgroundAudioLoading) return;
+    if (_disposed || _backgroundAudioLoading) return;
     _backgroundAudioLoading = true;
 
     YoutubeExplode? yt;
@@ -991,6 +997,7 @@ class _WebViewPageState extends State<WebViewPage> with WidgetsBindingObserver {
     required MediaItem mediaItem,
     required Duration position,
   }) async {
+    if (_disposed) return false;
     final attempts = <(String, List<YoutubeApiClient>?)>[
       ('ios', [YoutubeApiClient.ios]),
       ('androidVr', [YoutubeApiClient.androidVr]),
@@ -1033,6 +1040,9 @@ class _WebViewPageState extends State<WebViewPage> with WidgetsBindingObserver {
           'host=${audio.url.host} expire=$expire background=$_isInBackground',
         );
         try {
+          // 화면이 내려간 뒤라면 공유 플레이어를 건드리지 않는다.
+          // (저장파일 재생이 이미 이 플레이어를 쓰고 있을 수 있다.)
+          if (_disposed) return false;
           final loadedDuration = await _player.setAudioSource(
             AudioSource.uri(audio.url, tag: mediaItem),
             initialPosition: position,
@@ -1047,6 +1057,7 @@ class _WebViewPageState extends State<WebViewPage> with WidgetsBindingObserver {
             continue;
           }
           _btLog('try[$label#$i] loaded ok duration=$loadedDuration');
+          btPlaybackOrigin = BtPlaybackOrigin.web;
           _scheduleManifestRefresh(audio.url);
           return true;
         } on PlayerInterruptedException {
@@ -1119,6 +1130,7 @@ class _WebViewPageState extends State<WebViewPage> with WidgetsBindingObserver {
   }
 
   Future<void> _refreshBackgroundAudioSource() async {
+    if (_disposed) return;
     final vid = _backgroundVideoId;
     final mediaItem = _backgroundMediaItem;
     if (vid == null || mediaItem == null) return;

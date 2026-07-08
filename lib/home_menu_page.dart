@@ -11,6 +11,7 @@ class HomeMenuPage extends StatelessWidget {
   /// 재생 화면은 공유 플레이어를 만들므로, 진입 전에 오디오 초기화 완료를 보장한다.
   /// (앱 시작 시 백그라운드로 시작해 둔 초기화라 보통 이미 끝나 즉시 진입한다.)
   Future<void> _open(BuildContext context, Widget page) async {
+    debugPrint('[BT] nav: HomeMenu → ${page.runtimeType}');
     await ensureAudioReady();
     if (!context.mounted) return;
     Navigator.of(context).push(MaterialPageRoute(builder: (_) => page));

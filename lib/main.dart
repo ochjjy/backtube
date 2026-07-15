@@ -17,15 +17,15 @@ Future<void> main() async {
   debugPrint('[BT] boot: main() entered');
   WidgetsFlutterBinding.ensureInitialized();
   debugPrint('[BT] boot: WidgetsFlutterBinding ready');
-  // just_audio_background(내부 audio_service)는 runApp 전에 초기화가 끝나 있어야
-  // 안전하다. 실패하더라도 앱 화면은 떠야 하므로 try/catch로 감싼다.
-  try {
-    debugPrint('[BT] boot: ensureAudioReady begin');
-    await ensureAudioReady();
-    debugPrint('[BT] boot: ensureAudioReady done');
-  } catch (e, st) {
+  // 오디오 초기화(JustAudioBackground.init + 세션 설정)는 기기에 따라 수 초가
+  // 걸린다. runApp 앞에서 await 하면 그 시간만큼 첫 화면이 뜨지 않으므로,
+  // 백그라운드로 시작만 하고 첫 프레임을 막지 않는다. btPlayer는 첫 참조 때
+  // 생성되고 그 진입(HomeMenuPage._open)이 ensureAudioReady를 await 하므로,
+  // 실제 재생 전 초기화 완료는 그대로 보장된다.
+  debugPrint('[BT] boot: ensureAudioReady begin (background)');
+  unawaited(ensureAudioReady().catchError((Object e, StackTrace st) {
     debugPrint('[BT] audio init failed: $e\n$st');
-  }
+  }));
   debugPrint('[BT] boot: runApp');
   runApp(
     MaterialApp(
@@ -209,7 +209,27 @@ class _WebViewPageState extends State<WebViewPage> with WidgetsBindingObserver {
     _controller = WebViewController()
       ..setJavaScriptMode(JavaScriptMode.unrestricted)
       ..addJavaScriptChannel(_jsChannelName, onMessageReceived: (msg) async {
-        // 유튜브 "공유" 클릭 → 오디오 저장 메뉴.
+        // 진단: ⋮ 메뉴에 저장 항목이 실제로 주입됐는지 로그로 확인.
+        if (msg.message == 'save_menu_injected') {
+          _btLog('save menu item injected into YouTube ⋮ sheet');
+          return;
+        }
+        // 유튜브 ⋮(더보기) 메뉴에 끼워 넣은 "오디오로 저장" 클릭 → 바로 저장.
+        if (msg.message.startsWith('save:')) {
+          final id = msg.message.substring('save:'.length);
+          var videoId = id.isNotEmpty ? id : null;
+          videoId ??= await _safeCurrentVideoId();
+          if (!mounted) return;
+          if (videoId == null) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(content: Text('영상을 찾을 수 없습니다.')),
+            );
+            return;
+          }
+          await _startDownload(videoId);
+          return;
+        }
+        // 유튜브 "공유" 클릭 → 오디오 저장 메뉴(폴백 경로).
         if (msg.message.startsWith('share:')) {
           final sharedUrl = msg.message.substring('share:'.length);
           await _handleShareSaveRequest(sharedUrl);
@@ -262,6 +282,7 @@ class _WebViewPageState extends State<WebViewPage> with WidgetsBindingObserver {
           ''');
           await _injectPlaybackStateTracker();
           await _injectShareInterceptor();
+          await _injectSaveMenuItem();
         },
       ))
       ..loadRequest(Uri.parse('https://m.youtube.com'));
@@ -573,6 +594,126 @@ class _WebViewPageState extends State<WebViewPage> with WidgetsBindingObserver {
         postShare(window.location.href);
       }
     } catch (e) {}
+  }, true);
+})();
+""");
+  }
+
+  /// 유튜브 ⋮(더보기) 메뉴 시트에 "오디오로 저장" 항목을 끼워 넣는다.
+  /// 시트가 열릴 때 기존 항목(공유/재생목록에 저장 등)을 복제해 스타일을 그대로
+  /// 물려받고 텍스트만 교체한다(클래스명 하드코딩을 피해 덜 깨지게 함).
+  /// 대상 videoId는 ⋮ 클릭 시점에 근처 watch 링크에서 잡아 둔다.
+  /// 주입에 실패해도 기존 '공유' 가로채기(_injectShareInterceptor)가 폴백이 된다.
+  Future<void> _injectSaveMenuItem() async {
+    await _controller.runJavaScript(r"""
+(function() {
+  if (window.__btSaveMenuHooked) return;
+  window.__btSaveMenuHooked = true;
+
+  function captureVideoId(startEl) {
+    var el = startEl;
+    for (var i = 0; i < 10 && el; i++, el = el.parentElement) {
+      if (!el.querySelector) continue;
+      var a = el.querySelector('a[href*="watch?v="], a[href*="/shorts/"], a[href*="youtu.be/"]');
+      if (a && a.href) {
+        var m = a.href.match(/[?&]v=([\w-]{6,})/) ||
+                a.href.match(/\/shorts\/([\w-]{6,})/) ||
+                a.href.match(/youtu\.be\/([\w-]{6,})/);
+        if (m) { window.__btMenuVideoId = m[1]; return; }
+      }
+    }
+  }
+
+  function labelOf(node) {
+    return (((node.getAttribute && node.getAttribute('aria-label')) ||
+             node.textContent || '') + '').trim();
+  }
+
+  var TARGETS = ['공유','Share','재생목록에 저장','Save to playlist',
+                 '나중에 볼 동영상에 저장','Save to Watch Later'];
+
+  function findTemplateItem() {
+    var nodes = document.querySelectorAll(
+      '[role=menuitem], ytm-menu-item, ytm-bottom-sheet-item, tp-yt-paper-item, .menu-item-button');
+    if (!nodes.length) nodes = document.querySelectorAll('a, button, li, div');
+    for (var i = 0; i < nodes.length; i++) {
+      var t = labelOf(nodes[i]);
+      for (var j = 0; j < TARGETS.length; j++) {
+        if (t === TARGETS[j]) {
+          var item = (nodes[i].closest && nodes[i].closest(
+            '[role=menuitem], ytm-menu-item, ytm-bottom-sheet-item, tp-yt-paper-item, li'))
+            || nodes[i];
+          if (item && item.parentElement) return item;
+        }
+      }
+    }
+    return null;
+  }
+
+  function replaceText(node, text) {
+    try {
+      var w = document.createTreeWalker(node, NodeFilter.SHOW_TEXT, null);
+      var tn;
+      while ((tn = w.nextNode())) {
+        if (tn.nodeValue && tn.nodeValue.trim().length) { tn.nodeValue = text; return; }
+      }
+    } catch (e) {}
+    try { node.textContent = text; } catch (e) {}
+  }
+
+  function closeSheet() {
+    try {
+      var back = document.querySelector(
+        'tp-yt-iron-overlay-backdrop, .bottom-sheet-scrim, ' +
+        '[aria-label="뒤로"], [aria-label="Back"], [aria-label="닫기"], [aria-label="Close"]');
+      if (back) back.click();
+    } catch (e) {}
+  }
+
+  function inject() {
+    try {
+      if (document.getElementById('bt-save-audio-item')) return true;
+      var tmpl = findTemplateItem();
+      if (!tmpl) return false;
+      var clone = tmpl.cloneNode(true);
+      clone.id = 'bt-save-audio-item';
+      if (clone.tagName === 'A') clone.removeAttribute('href');
+      var links = clone.querySelectorAll ? clone.querySelectorAll('a') : [];
+      for (var i = 0; i < links.length; i++) links[i].removeAttribute('href');
+      replaceText(clone, '오디오로 저장');
+      clone.addEventListener('click', function(e) {
+        e.preventDefault(); e.stopPropagation();
+        try { FullscreenListener.postMessage('save:' + (window.__btMenuVideoId || '')); } catch (er) {}
+        closeSheet();
+      }, true);
+      tmpl.parentElement.insertBefore(clone, tmpl.parentElement.firstChild);
+      try { FullscreenListener.postMessage('save_menu_injected'); } catch (er) {}
+      return true;
+    } catch (e) { return false; }
+  }
+
+  // ⋮(더보기/작업 메뉴)류 버튼 클릭인지. 아무 탭마다 DOM 전체를 스캔하지 않도록
+  // 게이트로 쓴다(메뉴와 무관한 탭에서는 주입 시도를 하지 않음).
+  function isMenuTrigger(startEl) {
+    var el = startEl;
+    for (var i = 0; i < 6 && el; i++, el = el.parentElement) {
+      var l = labelOf(el).toLowerCase();
+      if (l.indexOf('더보기') >= 0 || l.indexOf('작업') >= 0 ||
+          l.indexOf('more') >= 0 || l.indexOf('menu') >= 0 ||
+          l.indexOf('action') >= 0 || l.indexOf('옵션') >= 0 ||
+          l.indexOf('option') >= 0) return true;
+    }
+    return false;
+  }
+
+  // 항목/⋮ 클릭 시 videoId를 잡고, ⋮류면 시트가 렌더된 뒤 주입을 몇 번 시도한다.
+  document.addEventListener('click', function(e) {
+    captureVideoId(e.target);
+    if (!isMenuTrigger(e.target)) return;
+    var tries = 0;
+    var iv = setInterval(function() {
+      if (inject() || ++tries >= 10) clearInterval(iv);
+    }, 120);
   }, true);
 })();
 """);

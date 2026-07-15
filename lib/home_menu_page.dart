@@ -9,10 +9,23 @@ class HomeMenuPage extends StatelessWidget {
   const HomeMenuPage({super.key});
 
   /// 재생 화면은 공유 플레이어를 만들므로, 진입 전에 오디오 초기화 완료를 보장한다.
-  /// (앱 시작 시 백그라운드로 시작해 둔 초기화라 보통 이미 끝나 즉시 진입한다.)
+  /// 초기화는 앱 시작 시 백그라운드로 시작해 두므로 보통 이미 끝나 즉시 진입한다.
+  /// 아직 진행 중이면(초기화가 수 초 걸릴 수 있음) "초기화 중" 팝업을 띄우고,
+  /// 완료되면 팝업을 닫고 자동으로 진입한다.
   Future<void> _open(BuildContext context, Widget page) async {
-    debugPrint('[BT] nav: HomeMenu → ${page.runtimeType}');
-    await ensureAudioReady();
+    debugPrint('[BT] nav: HomeMenu → ${page.runtimeType} (audioReady=$audioReady)');
+    if (!audioReady) {
+      showDialog<void>(
+        context: context,
+        barrierDismissible: false,
+        builder: (_) => const _InitializingDialog(),
+      );
+      try {
+        await ensureAudioReady();
+      } catch (_) {}
+      if (!context.mounted) return;
+      Navigator.of(context, rootNavigator: true).pop(); // 초기화 팝업 닫기
+    }
     if (!context.mounted) return;
     Navigator.of(context).push(MaterialPageRoute(builder: (_) => page));
   }
@@ -110,6 +123,51 @@ class _MenuCard extends StatelessWidget {
                 const Icon(Icons.chevron_right_rounded),
               ],
             ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// 오디오 초기화가 끝날 때까지 잠깐 띄우는 "초기화 중" 팝업.
+/// 사용자가 임의로 닫아 진입 흐름과 어긋나지 않도록 뒤로가기/바깥탭을 막고,
+/// 초기화가 끝나면 _open이 자동으로 닫는다.
+class _InitializingDialog extends StatelessWidget {
+  const _InitializingDialog();
+
+  @override
+  Widget build(BuildContext context) {
+    return PopScope(
+      canPop: false,
+      child: Dialog(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(24, 22, 24, 22),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const SizedBox(
+                width: 22,
+                height: 22,
+                child: CircularProgressIndicator(strokeWidth: 2.5),
+              ),
+              const SizedBox(width: 18),
+              Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    '초기화 중...',
+                    style: Theme.of(context).textTheme.titleMedium,
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    '잠시만 기다려 주세요',
+                    style: Theme.of(context).textTheme.bodySmall,
+                  ),
+                ],
+              ),
+            ],
           ),
         ),
       ),

@@ -45,6 +45,10 @@ bool btPlayIntent = false;
 /// 한 번만 실행되도록 Future를 캐시한다.
 Future<void>? _audioInitFuture;
 
+/// 오디오 초기화가 끝났는지. 메뉴에서 재생 화면 진입 시, 아직이면 진행 표시를
+/// 띄우기 위해 참조한다(초기화는 기기에 따라 수 초 걸릴 수 있음).
+bool audioReady = false;
+
 Future<void> ensureAudioReady() => _audioInitFuture ??= _initAudio();
 
 Future<void> _initAudio() async {
@@ -55,9 +59,13 @@ Future<void> _initAudio() async {
     androidNotificationChannelName: 'BackTube Audio Playback',
     androidNotificationOngoing: true,
   );
-  debugPrint('[BT] boot: JustAudioBackground.init done ${sw.elapsedMilliseconds}ms');
+  final tInit = sw.elapsedMilliseconds;
   final session = await AudioSession.instance;
-  debugPrint('[BT] boot: AudioSession.instance ${sw.elapsedMilliseconds}ms');
+  final tSession = sw.elapsedMilliseconds;
   await session.configure(const AudioSessionConfiguration.music());
-  debugPrint('[BT] boot: audio init total ${sw.elapsedMilliseconds}ms');
+  audioReady = true;
+  debugPrint('[BT] boot: audio init done total=${sw.elapsedMilliseconds}ms '
+      '(JustAudioBackground.init=${tInit}ms, '
+      'AudioSession.instance=${tSession - tInit}ms, '
+      'configure=${sw.elapsedMilliseconds - tSession}ms)');
 }

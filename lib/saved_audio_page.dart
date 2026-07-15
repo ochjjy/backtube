@@ -290,8 +290,19 @@ class _SavedAudioPageState extends State<SavedAudioPage> {
     if (_items.isEmpty) return;
     final startIndex =
         (shuffle && _items.length > 1) ? Random().nextInt(_items.length) : 0;
-    // 재생 화면을 먼저 띄운다(랜덤은 시작곡을 알 수 없어 힌트 생략).
-    _openPlayer(initial: shuffle ? null : _mediaItemFor(_items[startIndex]));
+    // 재생 화면을 먼저 띄우고(랜덤은 시작곡을 알 수 없어 힌트 생략), 무거운
+    // 재생 셋업은 전환이 끝난 뒤 시작해 화면 전환을 매끄럽게 한다.
+    _openPlayer(
+      initial: shuffle ? null : _mediaItemFor(_items[startIndex]),
+      onEntered: () =>
+          unawaited(_startPlayAll(shuffle: shuffle, startIndex: startIndex)),
+    );
+  }
+
+  Future<void> _startPlayAll({
+    required bool shuffle,
+    required int startIndex,
+  }) async {
     try {
       final session = await AudioSession.instance;
       await session.setActive(true);
@@ -313,25 +324,60 @@ class _SavedAudioPageState extends State<SavedAudioPage> {
     }
   }
 
-  void _openPlayer({MediaItem? initial}) {
+  /// 재생 화면을 연다. [onEntered]가 있으면 진입 전환 애니메이션이 끝난 뒤
+  /// 호출한다. 무거운 오디오 셋업(session.setActive/setAudioSources/play 등은
+  /// iOS 메인스레드에서 실행돼 전환 프레임을 막는다)을 전환 완료 후로 미뤄
+  /// 화면 전환을 매끄럽게 하기 위함이다.
+  void _openPlayer({MediaItem? initial, VoidCallback? onEntered}) {
     debugPrint('[BT] nav: SavedAudioPage → PlayerScreen (곡="${initial?.title}")');
-    Navigator.of(context).push(
-      MaterialPageRoute(builder: (_) => PlayerScreen(initialMedia: initial)),
+    final route = MaterialPageRoute<void>(
+      builder: (_) => PlayerScreen(initialMedia: initial),
     );
+    Navigator.of(context).push(route);
+    if (onEntered == null) return;
+
+    // push 직후에는 route.animation이 아직 설치되지 않아 null일 수 있다. 이때
+    // 고정 지연으로 발화하면 전환 "도중"에 무거운 작업이 끼어들어 애니메이션이
+    // 반쯤에서 멈춘다. 다음 프레임(설치 완료 후)에 진입 애니메이션을 구독해,
+    // 전환이 "완전히 끝난" 시점에만 onEntered를 호출한다.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      final anim = route.animation;
+      if (anim == null || anim.status == AnimationStatus.completed) {
+        onEntered();
+        return;
+      }
+      void listener(AnimationStatus status) {
+        if (status == AnimationStatus.completed) {
+          anim.removeStatusListener(listener);
+          if (mounted) onEntered();
+        } else if (status == AnimationStatus.dismissed) {
+          // 전환이 끝나기 전에 되돌아갔으면(즉시 pop) 재생하지 않는다.
+          anim.removeStatusListener(listener);
+        }
+      }
+
+      anim.addStatusListener(listener);
+    });
   }
 
-  /// 파일 탭: 재생 화면을 즉시 띄우고 재생은 화면 뒤에서 시작한다(탭 즉시 전환).
-  /// 다른 곡이면 현재 목록을 큐로 만들어(이전/다음 동작) 그 곡부터 재생한다.
+  /// 파일 탭: 재생 화면을 즉시 띄우고, 다른 곡이면 전환이 끝난 뒤 재생을
+  /// 시작한다(탭 즉시 전환 + 매끄러운 애니메이션). 재생 시작은 현재 목록을
+  /// 큐로 만들어(이전/다음 동작) 그 곡부터 순차 재생한다.
   void _onTapItem(SavedAudio item) {
     debugPrint('[BT] tap: 곡 클릭 id=${item.videoId} title="${item.title}" '
         'currentId=$_currentVideoId');
-    if (_currentVideoId != item.videoId) {
-      debugPrint('[BT] tap: 새 곡 → _playFrom 시작');
-      unawaited(_playFrom(item));
-    } else {
-      debugPrint('[BT] tap: 이미 현재 곡 → 재생화면만 열기');
-    }
-    _openPlayer(initial: _mediaItemFor(item));
+    final isNewSong = _currentVideoId != item.videoId;
+    if (!isNewSong) debugPrint('[BT] tap: 이미 현재 곡 → 재생화면만 열기');
+    _openPlayer(
+      initial: _mediaItemFor(item),
+      onEntered: isNewSong
+          ? () {
+              debugPrint('[BT] tap: 전환 완료 → _playFrom 시작');
+              unawaited(_playFrom(item));
+            }
+          : null,
+    );
   }
 
   /// 현재 목록(_items)을 큐로 만들고 [item]부터 순차 재생한다.
@@ -345,18 +391,31 @@ class _SavedAudioPageState extends State<SavedAudioPage> {
       return;
     }
     try {
+      // 어느 네이티브 호출이 UI를 멈추게 하는지 특정하기 위한 구간별 소요시간.
+      final sw = Stopwatch()..start();
+      int lap() {
+        final ms = sw.elapsedMilliseconds;
+        sw.reset();
+        return ms;
+      }
+
       final session = await AudioSession.instance;
       await session.setActive(true);
+      debugPrint('[BT] playFrom.t: setActive=${lap()}ms');
 
       final sources = _items.map(_sourceFor).toList();
+      debugPrint('[BT] playFrom.t: buildSources(${sources.length})=${lap()}ms');
       await btPlayer.stop();
+      debugPrint('[BT] playFrom.t: stop=${lap()}ms');
       await btPlayer.setShuffleModeEnabled(false);
       await btPlayer.setLoopMode(_loopMode);
       await btPlayer.setAudioSources(sources, initialIndex: startIndex);
+      debugPrint('[BT] playFrom.t: setAudioSources=${lap()}ms');
       btPlaybackOrigin = BtPlaybackOrigin.saved;
       setState(() => _currentVideoId = item.videoId);
       debugPrint('[BT] playFrom: setAudioSources 완료 → 재생 시도');
       await _playWithRetry(session);
+      debugPrint('[BT] playFrom.t: playWithRetry=${lap()}ms');
       debugPrint('[BT] playFrom: 재생 상태 playing=${btPlayer.playing} '
           'dur=${btPlayer.duration}');
     } catch (e) {

@@ -5,6 +5,20 @@ import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:youtube_explode_dart/youtube_explode_dart.dart';
 
+/// 저장 불가 사유를 사용자에게 그대로 보여주기 위한 예외.
+/// toString()이 메시지 자체라 UI에 "Exception:" 접두어가 붙지 않는다.
+class AudioUnavailableException implements Exception {
+  final String message;
+
+  /// 처리 중·봇 확인처럼 시간이 지나면 성공할 수 있는 경우 true.
+  final bool retryable;
+
+  const AudioUnavailableException(this.message, {this.retryable = false});
+
+  @override
+  String toString() => message;
+}
+
 /// 로컬에 저장된 오디오 한 건의 메타데이터.
 class SavedAudio {
   final String videoId;
@@ -300,7 +314,107 @@ class DownloadService {
         debugPrint('[BT] download manifest[$label] failed: $e');
       }
     }
+    // 모든 후보가 실패했으면 YouTube에 왜 재생 불가인지 직접 물어 사용자용
+    // 안내로 바꾼다. 판별 불가면 기존 기술 메시지(라이브러리 고장 진단용) 유지.
+    final diagnosis = await _diagnoseUnavailable(videoId);
+    if (diagnosis != null) throw diagnosis;
     throw Exception('모든 매니페스트 후보 실패: $lastError');
+  }
+
+  /// 매니페스트가 모두 실패했을 때, YouTube의 재생 가능 상태를 직접 조회해
+  /// 사용자용 안내 메시지를 만든다. 판별할 수 없으면 null.
+  ///
+  /// youtube_explode의 매니페스트 예외는 ios 경로가 널 크래시라 사유를 구분할
+  /// 수 없어, InnerTube player를 가볍게 직접 호출한다(스트림 다운로드가 아니라
+  /// playabilityStatus만 읽는다). 라이브 종료 직후 "처리 중"(post-live DVR)
+  /// 상태에서는 어떤 스트림도 아직 발행되지 않아 이 경로로만 구분 가능하다.
+  static Future<AudioUnavailableException?> _diagnoseUnavailable(
+    String videoId,
+  ) async {
+    final client = HttpClient();
+    try {
+      final uri = Uri.parse(
+        'https://www.youtube.com/youtubei/v1/player'
+        '?key=AIzaSyB-63vPrdThhKuerbB2N_l7Kwwcxj6yUAc&prettyPrint=false',
+      );
+      final req = await client.postUrl(uri);
+      req.headers.contentType = ContentType.json;
+      // hl=en으로 받아 reason 키워드 매칭을 안정화한다(표시는 우리 문구 사용).
+      req.add(utf8.encode(jsonEncode({
+        'context': {
+          'client': {
+            'clientName': 'IOS',
+            'clientVersion': '20.10.4',
+            'deviceMake': 'Apple',
+            'deviceModel': 'iPhone16,2',
+            'userAgent': 'com.google.ios.youtube/20.10.4 '
+                '(iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)',
+            'hl': 'en',
+            'platform': 'MOBILE',
+            'osName': 'IOS',
+            'osVersion': '18.1.0.22B83',
+            'timeZone': 'UTC',
+            'gl': 'US',
+            'utcOffsetMinutes': 0,
+          },
+        },
+        'videoId': videoId,
+      })));
+      final resp = await req.close().timeout(const Duration(seconds: 15));
+      if (resp.statusCode != 200) return null;
+      final body = await resp.transform(utf8.decoder).join();
+      final json = jsonDecode(body) as Map<String, dynamic>;
+      final playability = json['playabilityStatus'] as Map<String, dynamic>?;
+      final status = playability?['status'] as String?;
+      final reason = (playability?['reason'] as String?) ?? '';
+      final details = json['videoDetails'] as Map<String, dynamic>?;
+      final isPostLiveDvr = details?['isPostLiveDvr'] == true;
+      debugPrint('[BT] diagnose status=$status reason="$reason" '
+          'postLiveDvr=$isPostLiveDvr');
+
+      final lower = reason.toLowerCase();
+
+      // 라이브 방송 관련(종료 직후 VOD 미준비/처리 중/시작 전)은 status가 OK로
+      // 바뀌어도 isPostLiveDvr=true인 동안 받을 수 있는 오디오 스트림이 없다.
+      // 그래서 status==OK 조기반환보다 먼저 검사한다.
+      if (isPostLiveDvr ||
+          lower.contains('processing') ||
+          lower.contains('live event has ended') ||
+          lower.contains('live event will begin') ||
+          lower.contains('premiere')) {
+        return const AudioUnavailableException(
+          '라이브 방송이 종료되어 유튜브가 다시보기(VOD)를 준비 중입니다.\n'
+          '변환이 끝나면 저장할 수 있어요. 잠시 후 다시 시도해 주세요.',
+          retryable: true,
+        );
+      }
+      if (lower.contains('bot')) {
+        return const AudioUnavailableException(
+          '유튜브가 봇 확인을 요구해 지금은 스트림을 가져올 수 없습니다.\n'
+          '잠시 후 다시 시도해 주세요.',
+          retryable: true,
+        );
+      }
+      if (status == 'LOGIN_REQUIRED') {
+        return const AudioUnavailableException(
+          '로그인이 필요한 영상이라 저장할 수 없습니다(연령 제한 또는 비공개).',
+        );
+      }
+      // status가 OK인데 여기까지 왔다면 라이브도 아니고 일시적/알 수 없는 문제 →
+      // 기존 기술 메시지로 넘겨 진짜 라이브러리 고장이 드러나게 둔다(yt_probe).
+      if (status == null || status == 'OK') return null;
+
+      // UNPLAYABLE / ERROR 등: 비공개·삭제·멤버십 전용·지역 차단 등.
+      return const AudioUnavailableException(
+        '재생할 수 없는 영상이라 저장할 수 없습니다\n'
+        '(비공개·삭제·멤버십 전용 또는 지역 차단).',
+      );
+    } catch (e) {
+      debugPrint('[BT] diagnose failed: $e');
+      return null;
+    } finally {
+      client.close();
+    }
   }
 
   /// 지정 폴더(null=루트)의 저장된 오디오 목록. 제목 오름차순.

@@ -707,8 +707,16 @@ class _WebViewPageState extends State<WebViewPage> with WidgetsBindingObserver {
       _btLog('save audio error: $e');
       if (mounted) {
         Navigator.of(context, rootNavigator: true).pop();
+        // 재생 불가/처리 중 등 사용자에게 설명 가능한 사유는 접두어 없이
+        // 안내 문구 그대로, 읽을 시간을 주어 보여준다.
+        final unavailable = e is AudioUnavailableException;
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('저장 실패: $e')),
+          SnackBar(
+            content: Text(unavailable ? '$e' : '저장 실패: $e'),
+            duration: unavailable
+                ? const Duration(seconds: 6)
+                : const Duration(seconds: 4),
+          ),
         );
       }
     } finally {

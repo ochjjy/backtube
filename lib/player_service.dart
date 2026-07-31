@@ -5,9 +5,8 @@ import 'package:just_audio_background/just_audio_background.dart';
 
 /// just_audio_background는 앱 전체에서 단일 AudioPlayer 인스턴스를 전제로 한다.
 /// dispose 후 재생성하면 iOS 오디오 세션과 알림(제어센터) 바인딩이 끊기므로,
-/// 유튜브 백그라운드 오디오(WebViewPage)와 저장파일 재생(SavedAudioPage)이
-/// 이 하나의 인스턴스를 공유한다. 앱 생명주기 내내 살아 있어야 하므로
-/// 어느 화면에서도 dispose 하지 않는다.
+/// 저장파일 재생(SavedAudioPage/PlayerScreen)이 이 하나의 인스턴스를 쓴다.
+/// 앱 생명주기 내내 살아 있어야 하므로 어느 화면에서도 dispose 하지 않는다.
 ///
 /// 주의: 이 전역은 첫 참조 시점에 생성된다. just_audio_background.init()이
 /// 먼저 끝나 있어야 하므로, 플레이어를 쓰기 전에 반드시 ensureAudioReady()를
@@ -22,16 +21,23 @@ final AudioPlayer btPlayer = AudioPlayer(
     ),
     darwinLoadControl: DarwinLoadControl(
       preferredForwardBufferDuration: Duration(seconds: 60),
+      // 라이브(HLS) 데이터 절약용 상한. 평소에는 라이브 최저 변형(실측 약
+      // 228kbps)을 직접 지정하므로 걸리지 않지만, 변형 선택이 실패해 master
+      // 매니페스트로 폴백하면 AVPlayer가 1080p(4.5Mbps)를 골라 버린다.
+      // 그 최악의 경우를 막는 안전장치다. 저장 파일(로컬 재생)에는 영향 없다.
+      preferredPeakBitRate: 320000,
+      // 정지 중에는 라이브를 따라가느라 계속 내려받지 않는다(기본값이지만 명시).
+      canUseNetworkResourcesForLiveStreamingWhilePaused: false,
     ),
   ),
 );
 
 /// btPlayer에 지금 로드돼 있는 오디오의 출처.
-/// 유튜브 웹(WebViewPage)이 백그라운드 재생용으로 미리 로드(prepare)해 둔
-/// 소스를, 저장파일 화면(SavedAudioPage)이 "이 저장곡을 재생 중"이라고
-/// 오인하지 않도록 출처를 표시한다. 두 화면이 같은 videoId를 가리킬 때
-/// (= 보고 있던 영상을 그대로 저장한 경우) 재생이 엉키는 것을 막는다.
-enum BtPlaybackOrigin { none, web, saved }
+/// SavedAudioPage는 origin == saved 일 때만 현재 곡을 물려받고, LiveSession은
+/// origin != live가 되면(=다른 재생이 시작되면) 스스로 물러난다.
+/// (web은 유튜브 웹뷰의 백그라운드 자동 재생 시절의 값으로, 그 경로를 제거한
+/// 지금은 세팅되지 않는다. 웹 소스를 다시 로드하는 코드가 생기면 그때 사용할 것.)
+enum BtPlaybackOrigin { none, web, saved, live }
 
 BtPlaybackOrigin btPlaybackOrigin = BtPlaybackOrigin.none;
 

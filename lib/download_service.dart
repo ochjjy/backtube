@@ -5,6 +5,8 @@ import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:youtube_explode_dart/youtube_explode_dart.dart';
 
+import 'yt_audio_language.dart';
+
 /// 저장 불가 사유를 사용자에게 그대로 보여주기 위한 예외.
 /// toString()이 메시지 자체라 UI에 "Exception:" 접두어가 붙지 않는다.
 class AudioUnavailableException implements Exception {
@@ -277,14 +279,16 @@ class DownloadService {
 
   /// 다운로드 가능한 오디오 스트림을 찾는다. ios 스트림이 iOS AVPlayer 재생과
   /// 가장 잘 맞으므로 저장 파일도 ios를 우선 시도하고, ios 매니페스트가 403이면
-  /// androidVr·default 순으로 폴백한다. (재생 로더 _loadPlayableAudio와 동일 순서)
+  /// androidVr·default 순으로 폴백한다.
   static Future<AudioOnlyStreamInfo> _resolveAudioStream(
     YoutubeExplode yt,
     String videoId,
   ) async {
+    // hl을 한국어로 덮어 자동 더빙 영상이 영어 더빙이 아닌 한국어(원본)
+    // 오디오를 내려주게 한다. (원인/배경은 yt_audio_language.dart 참고)
     final attempts = <(String, List<YoutubeApiClient>?)>[
-      ('ios', [YoutubeApiClient.ios]),
-      ('androidVr', [YoutubeApiClient.androidVr]),
+      ('ios', [withAudioLanguage(YoutubeApiClient.ios)]),
+      ('androidVr', [withAudioLanguage(YoutubeApiClient.androidVr)]),
       ('default', null),
     ];
     Object? lastError;
@@ -295,12 +299,14 @@ class DownloadService {
                 : yt.videos.streamsClient
                     .getManifest(videoId, ytClients: clients))
             .timeout(const Duration(seconds: 30));
-        final mp4 = manifest.audioOnly
-            .where((s) => s.container == StreamContainer.mp4);
+        // 매니페스트에 여러 언어 트랙이 섞여 오면 기본(원본) 트랙만 남긴다.
+        final tracked = preferDefaultAudioTrack(manifest.audioOnly);
+        final mp4 =
+            tracked.where((s) => s.container == StreamContainer.mp4);
         // iOS AVPlayer는 webm/opus를 재생 못 하므로 저장 파일도 mp4만 받는다.
         // (mp4가 없으면 이 클라이언트는 건너뛰고 다음 후보로.)
         final Iterable<AudioOnlyStreamInfo> pool =
-            Platform.isIOS ? mp4 : manifest.audioOnly;
+            Platform.isIOS ? mp4 : tracked;
         if (pool.isEmpty) {
           debugPrint('[BT] download manifest[$label]: no mp4 audio on iOS, skip');
           continue;

@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import 'live_screen.dart' show openLiveAudio;
 import 'main.dart' show WebViewPage;
 import 'player_service.dart';
 import 'saved_audio_page.dart';
@@ -57,8 +58,17 @@ class HomeMenuPage extends StatelessWidget {
                   _MenuCard(
                     icon: Icons.smart_display_rounded,
                     label: '유튜브라이브',
-                    description: '유튜브 열기 · 백그라운드 재생',
+                    description: '유튜브 열기 · 오디오로 저장',
                     onTap: () => _open(context, const WebViewPage()),
+                  ),
+                  const SizedBox(height: 20),
+                  // 이 메뉴는 화면(웹뷰) 없이 라이브 페이지를 파싱해 오디오만
+                  // 물고 오므로, _open이 아니라 전용 진입 함수를 쓴다.
+                  _MenuCard(
+                    icon: Icons.podcasts_rounded,
+                    label: '한국경제Live',
+                    description: '한국경제TV 실시간 오디오 청취',
+                    onTap: () => openLiveAudio(context),
                   ),
                 ],
               ),

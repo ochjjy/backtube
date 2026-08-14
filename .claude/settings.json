@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(PATH=/Users/michaelauk/work/kwic/flutter/flutter/bin:__TRACKED_VAR__ flutter analyze)"
+    ]
+  }
+}

@@ -239,10 +239,15 @@ class _SavedAudioPageState extends State<SavedAudioPage> {
 
   /// 짧은 지연 후에도 재생이 안 걸렸으면 세션 재활성화 후 1회 재시도.
   /// (유튜브 재생 실패 잔해로 AVPlayer가 복구 중일 때 대비)
+  ///
+  /// play()를 await 하지 않는 이유는 AGENTS.md §2.4.1. 그 Future는 재생이
+  /// "시작될 때"가 아니라 "끝나거나 일시정지될 때" 완료되므로, await 하면 이
+  /// 함수가 곡이 끝날 때까지 파킹돼 있다가 **사용자가 정지를 누른 순간** 깨어나
+  /// 아래 재시도를 실행해 버린다(= 정지가 자동 재생으로 되살아나는 버그).
   Future<void> _playWithRetry(AudioSession session) async {
     btPlayIntent = true;
     await btPlayer.setSpeed(_speed);
-    await btPlayer.play();
+    unawaited(btPlayer.play());
     await Future<void>.delayed(const Duration(milliseconds: 400));
     if (!btPlayer.playing) {
       // 그 사이 사용자가 일시정지를 눌렀다면(의도=정지) 재시도하지 않는다.
@@ -253,7 +258,7 @@ class _SavedAudioPageState extends State<SavedAudioPage> {
       }
       debugPrint('[BT] saved play retry (player not started)');
       await session.setActive(true);
-      if (btPlayIntent) await btPlayer.play();
+      if (btPlayIntent) unawaited(btPlayer.play());
     }
   }
 

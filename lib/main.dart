@@ -435,7 +435,57 @@ class _WebViewPageState extends State<WebViewPage> {
     );
   }
 
+  /// 저장이 진행 중이면 그 취소 토큰, 아니면 null.
+  ///
+  /// 진행 팝업은 모달이라 평소에는 저장 요청이 겹칠 수 없지만, "취소"를 누르면
+  /// 팝업은 즉시 닫히는 반면 뒷정리(중간에 끊지 못하는 네트워크 대기 + `.part`
+  /// 삭제)는 몇 초 더 걸린다. 그 틈에 다시 저장을 누르면 같은 파일에 두 다운로드가
+  /// 붙어 `.part` 삭제와 rename이 서로를 덮어쓴다. 그래서 뒷정리가 끝날 때까지
+  /// 재진입을 막고, 왜 지금 안 되는지 팝업으로 알려 준다.
+  DownloadCancelToken? _activeDownload;
+
   Future<void> _startDownload(String videoId) async {
+    final active = _activeDownload;
+    if (active != null) {
+      _btLog('save audio: 진행 중이라 재진입 차단 '
+          '(cancelling=${active.isCancelled}) videoId=$videoId');
+      await _showDownloadBusyNotice(cancelling: active.isCancelled);
+      return;
+    }
+    final cancelToken = DownloadCancelToken();
+    _activeDownload = cancelToken;
+    try {
+      await _runDownload(videoId, cancelToken);
+    } finally {
+      _activeDownload = null;
+    }
+  }
+
+  /// 저장이 이미 돌고 있을 때의 안내. [cancelling]이면 취소 뒷정리 중이라
+  /// 잠시 후 다시 시도하면 된다는 뜻이다.
+  Future<void> _showDownloadBusyNotice({required bool cancelling}) async {
+    if (!mounted) return;
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(cancelling ? '저장 취소 정리 중' : '저장 진행 중'),
+        content: Text(cancelling
+            ? '이전 저장을 취소하고 정리하는 중입니다.\n잠시 후 다시 시도해 주세요.'
+            : '이미 다른 오디오를 저장하고 있습니다.\n완료된 뒤에 다시 시도해 주세요.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('확인'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _runDownload(
+    String videoId,
+    DownloadCancelToken cancelToken,
+  ) async {
     if (await DownloadService.isSaved(videoId)) {
       if (!mounted) return;
       final overwrite = await showDialog<bool>(
@@ -459,33 +509,66 @@ class _WebViewPageState extends State<WebViewPage> {
     // 전체 크기를 모르는 스트림도 있어 progress는 nullable(불확정) + 받은 용량 표시.
     final progress = ValueNotifier<double?>(null);
     final label = ValueNotifier<String>('준비 중...');
+
+    // 팝업은 취소·성공·실패 어느 경로로 닫히든 정확히 한 번만 닫아야 한다.
+    // rootNavigator.pop()을 그냥 부르면 사용자가 이미 취소로 닫은 뒤에 성공/실패
+    // 경로가 한 번 더 pop 해 웹뷰 화면까지 닫아 버린다. 그래서 팝업 자신의
+    // route context를 기억해 두고 닫힘 여부를 플래그로 지킨다.
+    BuildContext? dialogContext;
+    var dialogClosed = false;
+    void closeDialog() {
+      if (dialogClosed) return;
+      dialogClosed = true;
+      final ctx = dialogContext;
+      if (ctx != null && ctx.mounted) Navigator.of(ctx).pop();
+    }
+
     if (mounted) {
       showDialog<void>(
         context: context,
         barrierDismissible: false,
-        builder: (ctx) => AlertDialog(
-          title: const Text('오디오 저장 중...'),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              ValueListenableBuilder<double?>(
-                valueListenable: progress,
-                builder: (_, v, __) => LinearProgressIndicator(value: v),
+        builder: (ctx) {
+          dialogContext = ctx;
+          // 취소 버튼으로만 닫히게 한다(안드로이드 뒤로가기로 닫히면 다운로드는
+          // 계속 도는데 팝업만 사라져 진행 상황을 볼 수 없다).
+          return PopScope(
+            canPop: false,
+            child: AlertDialog(
+              title: const Text('오디오 저장 중...'),
+              content: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  ValueListenableBuilder<double?>(
+                    valueListenable: progress,
+                    builder: (_, v, __) => LinearProgressIndicator(value: v),
+                  ),
+                  const SizedBox(height: 12),
+                  ValueListenableBuilder<String>(
+                    valueListenable: label,
+                    builder: (_, v, __) => Text(v),
+                  ),
+                ],
               ),
-              const SizedBox(height: 12),
-              ValueListenableBuilder<String>(
-                valueListenable: label,
-                builder: (_, v, __) => Text(v),
-              ),
-            ],
-          ),
-        ),
+              actions: [
+                TextButton(
+                  onPressed: () {
+                    _btLog('save audio: 사용자 취소 videoId=$videoId');
+                    cancelToken.cancel();
+                    closeDialog();
+                  },
+                  child: const Text('취소'),
+                ),
+              ],
+            ),
+          );
+        },
       );
     }
 
     try {
       final saved = await DownloadService.saveAudio(
         videoId,
+        cancelToken: cancelToken,
         onBytes: (received, total) {
           progress.value = total > 0 ? received / total : null;
           label.value = total > 0
@@ -493,16 +576,26 @@ class _WebViewPageState extends State<WebViewPage> {
               : '${_fmtMb(received)} MB 받는 중...';
         },
       ).timeout(const Duration(minutes: 5));
+      closeDialog();
       if (mounted) {
-        Navigator.of(context, rootNavigator: true).pop();
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('저장 완료: ${saved.title}')),
         );
       }
+    } on DownloadCancelledException {
+      // 실패가 아니라 사용자의 선택이므로 에러 안내를 띄우지 않는다.
+      // (팝업은 취소를 누른 시점에 이미 닫혔다)
+      _btLog('save audio cancelled videoId=$videoId');
+      closeDialog();
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('저장을 취소했습니다')),
+        );
+      }
     } catch (e) {
       _btLog('save audio error: $e');
+      closeDialog();
       if (mounted) {
-        Navigator.of(context, rootNavigator: true).pop();
         // 재생 불가/처리 중 등 사용자에게 설명 가능한 사유는 접두어 없이
         // 안내 문구 그대로, 읽을 시간을 주어 보여준다.
         final unavailable = e is AudioUnavailableException;

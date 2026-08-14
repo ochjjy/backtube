@@ -10,6 +10,20 @@ import 'player_service.dart';
 /// 메뉴에서 라이브를 시작한다. 웹뷰 없이 페이지를 헤드리스로 파싱해 오디오만
 /// 물고 오므로, 해석이 끝나면 곧바로 재생 화면으로 들어간다.
 Future<void> openLiveAudio(BuildContext context) async {
+  // 이미 라이브 세션이 살아 있으면 다시 해석하지 않고 화면만 연다.
+  // start()는 stop() → 한경 페이지 재파싱 → InnerTube 재요청 → 소스 재로드라
+  // 듣고 있던 방송이 끊기고 "라이브 연결 중" 팝업까지 다시 뜬다.
+  // isActive는 세션이 살아 있고 공유 플레이어가 아직 라이브 것일 때만 true라,
+  // 그 사이 저장파일 재생이 끼어들었으면 정상적으로 새로 시작한다.
+  // (잠깐 정지 중이어도 화면만 열면 된다 — 재생 버튼의 togglePlay가 정지가
+  //  길었을 때 매니페스트를 새로 받아 붙는다.)
+  if (LiveSession.instance.isActive) {
+    debugPrint('[BT] live: 세션 유지 중 → 재해석 없이 화면만 열기 '
+        '(playing=${btPlayer.playing})');
+    await _pushLiveScreen(context);
+    return;
+  }
+
   // 공유 플레이어를 쓰기 전에 오디오 초기화 완료를 보장한다(AGENTS.md §2.6).
   if (!audioReady) {
     final busy = _BusyDialog()..show(context, '초기화 중...');
@@ -48,7 +62,11 @@ Future<void> openLiveAudio(BuildContext context) async {
     return;
   }
 
-  await Navigator.of(context).push(
+  await _pushLiveScreen(context);
+}
+
+Future<void> _pushLiveScreen(BuildContext context) {
+  return Navigator.of(context).push(
     MaterialPageRoute<void>(builder: (_) => const LiveScreen()),
   );
 }

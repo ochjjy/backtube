@@ -18,7 +18,7 @@
 |---|---|
 | [lib/main.dart](lib/main.dart) | `main()` + `WebViewPage`. m.youtube.com 웹뷰, 수평 스와이프 뒤로/앞으로, JS 주입(공유 가로채기 / ⋮메뉴에 "오디오로 저장" 항목), 저장 진행 다이얼로그. 오디오 재생 코드는 없다. |
 | [lib/player_service.dart](lib/player_service.dart) | 앱 전역 단일 `btPlayer`(AudioPlayer), `btPlaybackOrigin`, `btPlayIntent`, `ensureAudioReady()` / `audioReady`. |
-| [lib/download_service.dart](lib/download_service.dart) | m4a 다운로드·저장·폴더(1단계) 관리, 사이드카 메타(`<videoId>.json`)·썸네일(`<videoId>.jpg`), 실패 사유 진단(`_diagnoseUnavailable`), `AudioUnavailableException`. |
+| [lib/download_service.dart](lib/download_service.dart) | m4a 다운로드·저장·폴더(1단계) 관리, 사이드카 메타(`<videoId>.json`)·썸네일(`<videoId>.jpg`), 실패 사유 진단(`_diagnoseUnavailable`), `AudioUnavailableException`, 저장 취소(`DownloadCancelToken`). |
 | [lib/yt_audio_language.dart](lib/yt_audio_language.dart) | `withAudioLanguage()`(클라이언트 `hl` 덮어쓰기), `preferDefaultAudioTrack()`. 자동 더빙 영상의 언어 오선택 방지. |
 | [lib/live_service.dart](lib/live_service.dart) | 한국경제Live. 한경 페이지를 **헤드리스로 파싱**해 유튜브 라이브 id → InnerTube(ANDROID)로 HLS 획득 → 최저 대역 변형 선택. `LiveSession`이 만료 갱신·재연결을 유지한다. |
 | [lib/live_screen.dart](lib/live_screen.dart) | `openLiveAudio()` 진입 함수 + 라이브 청취 화면(재생/정지 버튼 하나 + 이퀄라이저 애니메이션). |
@@ -77,6 +77,7 @@
 - 데이터 절약 장치 3종: ⑴ 최저 변형 명시 선택, ⑵ `player_service.dart`의 `preferredPeakBitRate: 320000`(변형 선택 실패로 master에 폴백해도 1080p 4.5Mbps를 고르지 못하게 막는 안전장치), ⑶ `canUseNetworkResourcesForLiveStreamingWhilePaused: false`(정지 중 다운로드 없음). 아트워크도 maxres 대신 320px급을 고른다.
 - 세그먼트 1초, 라이브 윈도우 3개 → **seek·배속 불가**, `duration`은 null. 그래서 라이브 화면은 재생/정지 버튼 하나만 둔다.
 - 매니페스트 `expire` ≈ 6시간 → `LiveSession`이 만료 10분 전에 재발급한다.
+- **세션이 살아 있으면(`LiveSession.isActive`) 메뉴에서 다시 눌러도 재해석하지 않는다.** `openLiveAudio`는 그 경우 `LiveScreen`만 push한다. `start()`는 `stop()` → 한경 페이지 재파싱 → 소스 재로드라, 듣고 있던 방송이 끊긴다. `isActive`가 `btPlaybackOrigin == live`까지 보므로 그 사이 저장파일 재생이 끼어들었으면 정상적으로 새로 시작한다.
 
 ### 2.4 오디오 언어는 `hl`로 고른다
 내장 `YoutubeApiClient`는 `hl:'en'`이 하드코딩돼 있어, 자동 더빙 영상이 **영어 더빙 트랙을 default로** 내려준다. 스트림을 가져오는 모든 경로는 `withAudioLanguage(client)`(hl=ko)를 거치고, 매니페스트는 `preferDefaultAudioTrack()`으로 걸러야 한다(비트레이트 정렬만 하면 더빙 트랙이 더 높아 오염된다). `gl`(지역)은 지역제한 영상을 깨뜨리므로 건드리지 않는다.
@@ -107,6 +108,7 @@ just_audio의 `play()`가 돌려주는 Future는 **재생이 시작될 때가 �
 | 한국어 영상이 영어로 저장/재생됨 | `dart run --define=VID=<videoId> tool/yt_track_probe.dart` (‼️ `--define`은 파일 경로 **앞**에 와야 한다). |
 | 잠금화면 길이가 실제의 2배 | androidVr 스트림의 컨테이너 duration이 실제의 2배로 들어오는 결함. `SavedAudioPage._sourceFor`가 `ClippingAudioSource(end: item.duration)`로 보정한다 — 이 보정을 지우면 재발. |
 | 저장한 곡을 탭해도 무음 | §2.1의 `btPlaybackOrigin` 규칙 위반을 먼저 의심. |
+| 백그라운드(잠금화면·제어센터)에서 정지를 눌렀는데 다시 재생됨 | §2.4.1 위반. `await btPlayer.play()`가 있으면 그 코드는 곡이 끝날 때가 아니라 **정지를 누른 순간** 깨어난다 — `_playWithRetry`의 400ms 재시도가 그 타이밍에 실행돼 재생을 되살렸다. 백그라운드 정지는 앱 화면 토글을 거치지 않아 `btPlayIntent`가 true로 남으므로 그 가드로는 못 막는다. `unawaited`로 고침. |
 | 실기기 `flutter run`이 "connecting to vmService"에서 멈춤 | 기기 **설정 → 개인정보 보호 및 보안 → 로컬 네트워크**에서 앱 토글 ON. Info.plist에 Bonjour 키를 수동 추가하지 말 것(Flutter가 디버그 빌드에 자동 주입). `flutter run --release`로 우회 가능. |
 
 모든 런타임 로그는 `[BT] ` 접두어를 쓴다(`_btLog` / `debugPrint`). 새 로그도 이 접두어를 유지할 것 — 콘솔.app 필터가 여기에 걸려 있다.

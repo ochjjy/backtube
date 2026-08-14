@@ -100,7 +100,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
       await btPlayer.pause();
     } else {
       btPlayIntent = true;
-      await btPlayer.play();
+      // play()의 Future는 재생이 끝/정지될 때 완료된다(AGENTS.md §2.4.1) → await 금지.
+      unawaited(btPlayer.play());
     }
   }
 

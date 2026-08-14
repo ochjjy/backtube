@@ -21,6 +21,29 @@ class AudioUnavailableException implements Exception {
   String toString() => message;
 }
 
+/// 사용자가 저장을 취소했을 때. 실패가 아니므로 호출부는 에러 안내 대신
+/// "취소했습니다"만 보여준다.
+class DownloadCancelledException implements Exception {
+  const DownloadCancelledException();
+
+  @override
+  String toString() => '저장을 취소했습니다';
+}
+
+/// 저장 취소 신호. 진행 팝업의 "취소"가 [cancel]을 부르면 [DownloadService.saveAudio]가
+/// 다음 확인 지점(스트림 해석 전후, 청크 수신마다)에서 받다 만 `.part`를 지우고
+/// [DownloadCancelledException]을 던진다.
+///
+/// 확인 지점 사이의 긴 네트워크 대기(매니페스트 요청은 타임아웃 30초)는 중간에
+/// 끊지 못하므로, UI는 취소를 누른 즉시 팝업을 닫고 뒷정리는 이 토큰에 맡긴다.
+class DownloadCancelToken {
+  bool _cancelled = false;
+
+  bool get isCancelled => _cancelled;
+
+  void cancel() => _cancelled = true;
+}
+
 /// 로컬에 저장된 오디오 한 건의 메타데이터.
 class SavedAudio {
   final String videoId;
@@ -192,19 +215,30 @@ class DownloadService {
 
   /// 지정한 videoId의 오디오를 다운로드해 저장한다.
   /// [onBytes]는 (받은 바이트, 전체 바이트) — 전체를 모르면 total=0.
+  /// [cancelToken]이 취소되면 받다 만 `.part`를 지우고 [DownloadCancelledException].
   static Future<SavedAudio> saveAudio(
     String videoId, {
     void Function(int received, int total)? onBytes,
+    DownloadCancelToken? cancelToken,
   }) async {
+    void throwIfCancelled() {
+      if (cancelToken?.isCancelled ?? false) {
+        throw const DownloadCancelledException();
+      }
+    }
+
     final yt = YoutubeExplode();
     try {
       debugPrint('[BT] download start videoId=$videoId');
+      throwIfCancelled();
       final video =
           await yt.videos.get(videoId).timeout(const Duration(seconds: 30));
       debugPrint('[BT] download video ok: "${video.title}" '
           'videoDuration=${video.duration}');
 
+      throwIfCancelled();
       final audio = await _resolveAudioStream(yt, videoId);
+      throwIfCancelled();
       final total = audio.size.totalBytes;
       // 참고: 명목 비트레이트로 계산한 예상 길이. 실제 스트림 길이와 비교용.
       final approxSeconds = audio.bitrate.bitsPerSecond > 0
@@ -225,6 +259,8 @@ class DownloadService {
       final sink = tmp.openWrite();
       try {
         await for (final chunk in yt.videos.streamsClient.get(audio)) {
+          // break는 스트림 구독까지 취소하므로 남은 데이터를 더 받지 않는다.
+          if (cancelToken?.isCancelled ?? false) break;
           sink.add(chunk);
           received += chunk.length;
           onBytes?.call(received, total);
@@ -238,6 +274,16 @@ class DownloadService {
         await sink.close();
       }
       debugPrint('[BT] download finished received=$received bytes');
+
+      if (cancelToken?.isCancelled ?? false) {
+        // 받다 만 .part는 남기지 않는다(재개 기능이 없어 쓸모가 없다).
+        try {
+          await tmp.delete();
+        } catch (_) {}
+        debugPrint('[BT] download cancelled videoId=$videoId '
+            'received=$received/$total');
+        throw const DownloadCancelledException();
+      }
 
       if (received == 0) {
         try {

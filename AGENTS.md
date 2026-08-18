@@ -16,7 +16,7 @@
 
 | 파일 | 역할 |
 |---|---|
-| [lib/main.dart](lib/main.dart) | `main()` + `WebViewPage`. m.youtube.com 웹뷰, 수평 스와이프 뒤로/앞으로, JS 주입(공유 가로채기 / ⋮메뉴에 "오디오로 저장" 항목), 저장 진행 다이얼로그. 오디오 재생 코드는 없다. |
+| [lib/main.dart](lib/main.dart) | `main()` + `WebViewPage`. m.youtube.com 웹뷰, 수평 스와이프 뒤로/앞으로, JS 주입(공유 가로채기 / ⋮메뉴에 "오디오로 저장" 항목), 저장 진행·취소 다이얼로그, 봇 확인 우회(`_resolveViaWebView`, §2.3.3). 오디오 재생 코드는 없다. |
 | [lib/player_service.dart](lib/player_service.dart) | 앱 전역 단일 `btPlayer`(AudioPlayer), `btPlaybackOrigin`, `btPlayIntent`, `ensureAudioReady()` / `audioReady`. |
 | [lib/download_service.dart](lib/download_service.dart) | m4a 다운로드·저장·폴더(1단계) 관리, 사이드카 메타(`<videoId>.json`)·썸네일(`<videoId>.jpg`), 실패 사유 진단(`_diagnoseUnavailable`), `AudioUnavailableException`, 저장 취소(`DownloadCancelToken`). |
 | [lib/yt_audio_language.dart](lib/yt_audio_language.dart) | `withAudioLanguage()`(클라이언트 `hl` 덮어쓰기), `preferDefaultAudioTrack()`. 자동 더빙 영상의 언어 오선택 방지. |
@@ -27,6 +27,8 @@
 | [lib/home_menu_page.dart](lib/home_menu_page.dart) | 진입 메뉴(저장파일 / 유튜브라이브). 진입 전 `ensureAudioReady()` 보장. |
 | [tool/yt_probe.dart](tool/yt_probe.dart) | youtube_explode가 아직 스트림을 뽑는지 검증. |
 | [tool/yt_track_probe.dart](tool/yt_track_probe.dart) | 오디오 트랙(언어) 진단. |
+| [tool/yt_repeat_probe.dart](tool/yt_repeat_probe.dart) | 같은 프로세스에서 저장을 연속 수행해 단계별 소요시간·`requireWatchPage` 영향을 잰다. "준비 중이 길다 / 두 번째부터 안 된다" 진단용. |
+| [tool/yt_client_sweep.dart](tool/yt_client_sweep.dart) | InnerTube 클라이언트 11종을 훑어 매니페스트·mp4 오디오·URL 생존을 표로 낸다. 봇 확인에 막혔을 때 "다른 클라이언트로 우회되나"를 판단하는 근거(§2.3.3). |
 | [tool/wowtv_live_probe.dart](tool/wowtv_live_probe.dart) | 한국경제Live 3단계(페이지 파싱 → InnerTube → HLS) 진단. |
 
 의존성: `webview_flutter`, `just_audio` + `just_audio_background` + `audio_session`(+`audio_service`), `youtube_explode_dart`, `path_provider`.
@@ -50,6 +52,10 @@
 
 ### 2.3 클라이언트 시도 순서 — 저장과 라이브가 **다르다**
 저장(`_resolveAudioStream`)은 `ios → androidVr → default`. `ios`가 AVPlayer와 가장 잘 맞지만 매니페스트가 403인 영상이 있고, `default`(ANDROID)는 매니페스트는 나와도 AVPlayer가 로드 못 하는 경우가 있어 마지막 폴백이다. mp4가 없는 클라이언트는 건너뛴다.
+
+매니페스트는 **`requireWatchPage: true`(패키지 기본값)로 요청한다. 끄지 말 것.**
+
+한 번 껐다가 되돌린 이력이 있다. 끄면 빨라지는 건 사실이다(실측 2026-08-17, `tool/yt_repeat_probe.dart`: ios 매니페스트 1752~2055ms → 877~917ms). watch 페이지는 n/sig 챌린지를 풀 JS 솔버가 있을 때만 쓰이는데 이 앱은 솔버가 없으니 낭비로 보였다. **그런데 끄고 나서 저장이 아예 안 됐다.** watch 페이지를 함께 받으면 player 요청에 그 페이지의 쿠키·visitorData·STS가 실리는데(`video_controller.getPlayerResponse`), 그게 빠지면 유튜브가 세션을 신뢰하지 않아 스트림 URL이 §2.3.2.1의 "첫 1MB만" 제한에 걸리는 것으로 보인다. 1초 아끼려고 저장을 깨뜨릴 일이 아니다.
 
 **라이브는 반대다.** 실측(2026-07-31, 한국경제TV LIVE) 결과:
 
@@ -79,6 +85,98 @@
 - 매니페스트 `expire` ≈ 6시간 → `LiveSession`이 만료 10분 전에 재발급한다.
 - **세션이 살아 있으면(`LiveSession.isActive`) 메뉴에서 다시 눌러도 재해석하지 않는다.** `openLiveAudio`는 그 경우 `LiveScreen`만 push한다. `start()`는 `stop()` → 한경 페이지 재파싱 → 소스 재로드라, 듣고 있던 방송이 끊긴다. `isActive`가 `btPlaybackOrigin == live`까지 보므로 그 사이 저장파일 재생이 끼어들었으면 정상적으로 새로 시작한다.
 
+### 2.3.2 매니페스트 성공 ≠ 다운로드 가능 (다운로드는 우리가 직접 한다)
+매니페스트가 나와도 그 안의 스트림 URL이 403인 경우가 있다(특히 마지막 폴백 default(ANDROID)). 검증 없이 다운로드에 들어가면 youtube_explode가 **403 → 매니페스트 재조회 → 같은 URL 재시도를 조용히 무한 반복**한다(`YoutubeHttpClient._getStream`의 `while` 루프. 예외도 로그도 나오지 않는다). 실제로 "다운로드 시작 대기 중"에서 영영 멈추는 버그가 났다(2026-08-17).
+
+- **다운로드를 패키지에 맡기지 않는다.** `_rangedDownload`가 직접 range 요청으로 받는다(`yt.videos.streamsClient.get()`은 쓰지 않는다). 실패가 즉시 예외로 드러나고 재시도 횟수도 우리가 정한다. 조각은 1MB이며(§2.3.2.1 — 그보다 크면 403), 끊기면 **받은 지점부터** 같은 조각을 최대 3회 다시 요청한다. 실측(2026-08-18, 청크 1MB로 강제): ANDROID·IOS 양쪽 모두 4조각 바이트 수 정확히 일치.
+- `_stallTimeout`(45초): 데이터가 한 조각도 안 오면 끊고 사용자에게 안내한다. 무한 대기 자체를 불가능하게 하는 안전장치.
+- **다운로드 403은 URL을 갈아타는 신호다**(`_StreamForbidden`). 재시도해도 같은 403이 반복될 뿐이므로(실측: 4연발) 곧바로 웹뷰 세션 URL(§2.3.3)로 바꿔 한 번 더 받는다. 매니페스트가 성공했다고 해서 스트림 URL이 살아 있는 건 아니다 — 봇 확인이 걸린 기기에서 `manifest[android] OK → 다운로드 403`이 실측됐다.
+
+**URL을 미리 찔러 보는 사전 검증은 두지 않는다.** 예전에 `_streamUrlWorks`가 1KB만 받아 후보를 걸렀는데, ⑴ 판정이 실제 다운로드와 어긋났고(검증 206 → 곧이은 다운로드 403), ⑵ 요청을 한 번 더 보내는 것 자체가 이미 의심받는 IP의 rate limit을 더 건드리며, ⑶ 애초 목적(죽은 URL로 무한 대기 방지)은 다운로더를 직접 구현하면서 사라졌다. **검증은 실제 다운로드가 대신한다.**
+
+### 2.3.2.1 PO token이 없는 URL은 **첫 1MB만** 받아진다 (403의 진짜 원인)
+저장이 403으로 죽던 문제의 근본 원인. 유튜브는 PO token(`pot`)이 없는 스트림 URL에 **처음 약 1MB만 주고 그 뒤 range 요청을 전부 403으로 막는다.** 실측(2026-08-18):
+
+| 요청 | 결과 |
+|---|---|
+| `bytes=0-1048575` (첫 1MB) | 206 |
+| `bytes=0-1199999` (1.2MB) | **403** |
+| `bytes=7340032-8388607` (중간 1MB) | **403** |
+| 1MB씩 순차 → 2번째 조각 | **403** |
+
+**어느 클라이언트로 받은 URL이냐가 갈림길이다.** 클라이언트 13종을 "2번째 1MB 조각까지 받아지는가"로 검사한 결과(2026-08-18, 실패 영상 kH-it8YaWls). 1KB 검증은 전부 통과하므로 **반드시 2번째 조각까지 봐야 한다**:
+
+| 클라이언트 | 결과 |
+|---|---|
+| **ANDROID_VR** | PO token 없이 **전체 다운로드 가능한 유일한 클라이언트**(다른 영상에서 14.8MB 완주 확인). 단 영상에 따라 `LOGIN_REQUIRED` |
+| ANDROID / IOS | 오디오는 나오지만 1조각 200 → **2조각 403, 20MB지점 403** |
+| ANDROID_MUSIC·ANDROID_CREATOR·IOS_MUSIC·IOS_CREATOR·TVHTML5 | `LOGIN_REQUIRED` |
+| MWEB / WEB | `UNPLAYABLE` |
+| WEB_EMBEDDED / TV_EMBEDDED | `ERROR` |
+
+즉 **ANDROID_VR이 `LOGIN_REQUIRED`를 내는 영상은 로그인 없이는 방법이 없다.** URL 서명(`sparams`)에 `range`가 없어 재-range 자체는 허용되고, `alr=yes`나 range 전달 방식(헤더/쿼리) 변경으로도 뚫리지 않는다 — 순수하게 PO token 게이팅이다.
+
+그래서 웹뷰의 in-page InnerTube 시도 목록은 **ANDROID_VR이 첫 번째**다(웹뷰 세션에서 나가므로 로그인 상태면 쿠키가 그대로 실린다).
+
+**로그인 없이 푸는 길은 PO token 수확이다.** 이 영상은 `hlsManifestUrl`도 `dashManifestUrl`도 없고 `serverAbrStreamingUrl`(SABR)만 있다 — 즉 유튜브가 PO token을 전제로 전달한다. 그런데 그 토큰은 **로그인과 무관하게 페이지의 BotGuard가 만든다**. 웹 플레이어가 로그인 없이 102분짜리를 재생한다는 것이 그 증거다. 그래서 `_injectPlayerCapture`는 Resource Timing에서 `pot=`가 실린 googlevideo 요청을 찾아 토큰을 `window.__btAuth`에 담고, `_resolveViaWebView`는 그것을 ⑴ 우리 InnerTube 요청 본문(`serviceIntegrityDimensions.poToken`)과 ⑵ 응답으로 받은 스트림 URL(`&pot=`) 양쪽에 붙인다. 토큰은 세션(visitorData)에 묶이므로 **반드시 페이지의 visitorData와 짝지어** 보내야 한다.
+
+토큰은 **재생 중에만** 나타난다(플레이어가 미디어를 요청해야 생긴다). 그래서 사용자 안내가 "웹뷰에서 그 영상을 재생한 상태로 다시 저장"이다.
+
+이전 실기기 실측:
+
+| 클라이언트 | 결과 |
+|---|---|
+| **androidVr** | 전체 완주 (14.8MB) ✅ |
+| android / default(androidSdkless) | 매번 1MB에서 403 |
+| ios | 패키지가 후보 자체를 버림(아래) |
+
+그래서 `_resolveAudioStream`의 후보 순서는 **androidVr가 첫 번째**다. 바꾸지 말 것.
+
+진단이 오래 걸린 이유: ⑴ 1KB 사전 검증은 항상 통과하고, ⑵ 3.4MB짜리 짧은 영상은 조각 크기가 전체 크기로 줄어 우연히 성공하며, ⑶ 봇 확인 메시지와 겹쳐 IP 평판 문제로 오인하기 쉽다. **`from > 0`에서 나는 403은 PO token 문제다.** URL을 새로 발급받아 이어받는 것도 소용없다(실측 — 제한은 URL이 아니라 세션에 걸린다).
+
+**`ios`가 늘 탈락하는 이유는 따로 있다.** `getManifest`는 매니페스트를 받은 뒤 `streams.first`에 HEAD를 날려 403이면 후보 전체를 버리는데, `streams.first`는 보통 **비디오** 스트림이다(실측: `returned 403 (stream: 137)` — itag 137은 1080p 비디오). 오디오는 멀쩡한데 통째로 탈락한다. 그래서 `_viaInnerTube`가 패키지를 거치지 않고 InnerTube를 직접 불러 오디오만 고르는 후보를 따로 만든다.
+
+**403을 만나면 다음 후보 URL로 갈아탄다.** 순서: 매니페스트 → 직접 androidVr → 직접 ios → 웹뷰 세션 → (그래도 안 되면) 웹뷰 안에서 직접 받기. 하나가 1MB에서 끊겼다고 저장을 포기하지 않는다.
+
+### 2.3.3 봇 확인("로그인하여 봇이 아님을 확인하세요") 우회는 웹뷰 세션이다
+유튜브가 봇 확인을 걸면 앱이 Dart에서 보내는 InnerTube 요청은 **어떤 클라이언트로도** 뚫리지 않는다. 실측(2026-08-17, `tool/yt_client_sweep.dart`): 패키지가 주는 11종 중 매니페스트가 나오는 것은 ios·androidVr·android·androidSdkless 넷뿐이고, 나머지(safari/mweb/tv/tvSimplyEmbedded/webCreator/mediaConnect/androidMusic)는 **봇 확인이 걸리지 않은 IP에서도** 전부 실패한다(유튜브가 인증을 요구하도록 바꿨고, 패키지도 셋을 `@Deprecated`로 표시했다). 클라이언트를 더 추가하는 건 우회책이 아니다.
+
+대신 앱에는 **이미 봇 확인을 통과한 세션**이 있다 — 사용자가 유튜브를 보던 웹뷰다. `main.dart`의 `_resolveViaWebView`가 그 안에서 스트림 URL을 받아 오고(같은 출처라 쿠키·visitorData가 자동으로 실린다 — 앱이 쿠키를 직접 다루지 않는다), 다운로드만 앱이 한다. 어느 경로든 **`url` 필드가 있는 포맷만** 고른다(`signatureCipher`는 JS 솔버 없이 못 푼다).
+
+해석 순서(앞이 성공하면 뒤는 시도하지 않는다):
+0. **`MEDIA-<itag>` — 플레이어가 지금 재생에 쓰고 있는 미디어 URL.** 가장 확실하다. `_injectPlayerCapture`가 **Resource Timing**(`performance.getEntriesByType('resource')`)·fetch/XHR·`<video>` 엘리먼트 세 곳에서 `googlevideo.com/videoplayback` URL을 주워 videoId·itag별로 모아 둔다. **Resource Timing이 핵심이다** — 실측(2026-08-18) `video=blob:`(MSE 재생 중)인데도 fetch/XHR 훅에는 아무것도 안 걸렸다. 유튜브가 워커나 미디어 엔진을 통해 요청을 내보내면 JS 훅을 우회하지만, Resource Timing에는 URL이 남는다(버퍼가 넘치지 않게 `setResourceTimingBufferSize(1000)`으로 키우고 2초마다 훑는다)(요청마다 달라지는 `range`/`rn`/`rbuf`/`sq` 등은 떼고 보관). **이미 재생되고 있는 URL이라 서명·`n`·PO token이 전부 유효**하므로 1MB 제한에 걸리지 않는다. player 응답을 뜯는 아래 경로들과 달리 서명 해독도 필요 없다. 오디오 itag 우선순위는 140 → 141 → 139. `clen`·`dur` 파라미터에서 크기와 길이도 함께 얻는다. 피드에서 인라인 재생하면 주소에 `v=`가 없어 videoId를 알 수 없는데, 그때는 `_last`에 담아 두고 **`clen`이 기대 크기와 정확히 일치할 때만** 쓴다(다른 영상 오디오를 저장하는 사고 방지). 기대 크기는 Dart가 매니페스트에서 얻어 `expectSize`로 넘긴다.
+1. `PAGE-CAPTURED` — `_injectPlayerCapture`가 가로챈 **페이지 자신의** player 응답(§2.3.2.1). 토큰이 붙어 있어 가장 좋다.
+2. `ytInitialPlayerResponse` — 지금 웹뷰가 열고 있는 watch 페이지의 초기 응답.
+3. `WATCH-HTML` — **웹뷰 세션으로 `/watch?v=<id>` HTML을 직접 fetch** 해 그 안의 `ytInitialPlayerResponse`를 중괄호 균형으로 잘라 쓴다. 사용자가 **피드 목록의 ⋮에서 바로 저장**하면 1·2가 비는데(그 영상의 watch 페이지를 연 적이 없다) 이 경로가 그때를 메운다.
+4. 우리가 만든 InnerTube 요청(ANDROID → IOS → 페이지 컨텍스트). 토큰이 없어 1MB 제한에 걸리므로 최후 수단이다.
+
+**페이지의 PO token을 훔쳐 쓴다.** 1MB 제한을 푸는 열쇠는 `pot`인데, 그 토큰은 페이지가 BotGuard로 만들어 **자기 player 요청 본문**(`serviceIntegrityDimensions.poToken`)에 실어 보낸다. 그래서 `_injectPlayerCapture`는 응답뿐 아니라 **요청 본문**도 가로채 토큰과 그것에 묶인 `visitorData`를 `window.__btAuth`에 담아 둔다. 우리가 만드는 InnerTube 요청은 그 둘을 그대로 실어 보낸다(토큰과 visitorData는 반드시 짝이 맞아야 한다).
+
+**진단이 로그에 남는다.** 웹뷰 해석은 실패해도 성공해도 `[pot=O/X media=… cap=… ipr=… html=… video=…]`를 함께 남긴다. 각 경로에 오디오 포맷이 몇 개 있었고 그중 **평문 URL이 몇 개/암호화(signatureCipher)가 몇 개**인지까지 센다. 이게 없던 동안 "왜 이 경로가 안 쓰였나"를 계속 추측해야 했다. `video=blob:`이면 MSE 재생(JS가 세그먼트를 받으므로 미디어 URL 가로채기가 가능), `video=https://`면 네이티브 재생(JS 훅에 안 걸린다)이라는 뜻이다.
+
+**모바일 watch 페이지의 `ytInitialPlayerResponse`는 대개 `signatureCipher`만 담고 평문 `url`이 없다**(실기기 실측 2026-08-18: `WATCH-HTML`이 걸리지 않고 4번으로 떨어졌다). 그래서 2·3번은 자주 비고, 실질적인 해답은 0번이다 — **사용자가 그 영상을 웹뷰에서 재생해야 잡힌다.**
+
+이 경로는 `AudioUnavailableException.botBlocked`일 때만 탄다. 다른 사유(비공개·처리 중)는 세션을 바꿔도 결과가 같다.
+
+다운로드가 403이면 후보를 바꿔 가며 계속한다: 매니페스트 → 직접 androidVr → 직접 ios → 웹뷰 세션 → 마지막으로 **다운로드까지 웹뷰 안에서**(`_downloadChunkViaWebView`, 조각을 base64로 채널에 실어 보낸다). ⑶이 가능한 것은 googlevideo가 웹뷰 출처에 CORS를 열어 두기 때문이다 — 실측(2026-08-18): `access-control-allow-origin: https://m.youtube.com`, `allow-credentials: true`, preflight가 `Range` 헤더 허용.
+
+**직접 받는 URL에는 range를 반드시 지정한다.** 그냥 GET 하면 유튜브가 재생 속도로 스로틀링한다 — 실측(2026-08-18, 3.4MB): range 없음 **102초** vs range 지정 **0.9초**. 110배다. `_rangedDownload`가 이 처리를 하고 있으니 지우지 말 것.
+
+### 2.3.4 메타 조회 실패가 저장을 막으면 안 된다
+`yt.videos.get()`은 **watch 페이지를 긁는** 요청이라 유튜브의 rate limit(`RequestLimitExceededException`, `GET /watch?v=…`)에 **가장 먼저** 걸린다. 실측(2026-08-18): 매니페스트는 멀쩡한데 이 요청만 429가 나서 저장 전체가 실패했다. 제목·썸네일은 저장의 필수 요소가 아니므로 `videoFuture`는 `catchError`로 null이 되게 두고 저장을 계속한다. **다시 `Future.wait`로 묶지 말 것** — 메타 실패가 저장을 죽인다.
+
+그래서 **저장 경로에서 `videos.get()`을 아예 부르지 않는다.** 지우고 나면 필요한 메타는 전부 더 싼 출처에 있다:
+
+| 항목 | 출처 | 비용 |
+|---|---|---|
+| 제목·저자 | 웹뷰 우회 응답의 `videoDetails`(있으면) → oEmbed(`/oembed?url=…&format=json`) | 가벼운 공개 API 1회 |
+| 길이 | **스트림 URL의 `dur` 파라미터** (`_durationFromUrl`) | 요청 0회 |
+| 썸네일 | `https://i.ytimg.com/vi/<id>/hqdefault.jpg` 고정 규칙 | 이미지 1회 |
+
+실측(2026-08-18): `dur=322.803` ↔ 실제 323초, oEmbed는 한국어 제목·채널명을 정확히 준다.
+
+메타는 **다운로드가 끝난 뒤에** 채운다. 순서가 중요하다 — 먼저 하면 그 요청들이 rate limit을 건드려 정작 스트림을 못 받는다.
+
 ### 2.4 오디오 언어는 `hl`로 고른다
 내장 `YoutubeApiClient`는 `hl:'en'`이 하드코딩돼 있어, 자동 더빙 영상이 **영어 더빙 트랙을 default로** 내려준다. 스트림을 가져오는 모든 경로는 `withAudioLanguage(client)`(hl=ko)를 거치고, 매니페스트는 `preferDefaultAudioTrack()`으로 걸러야 한다(비트레이트 정렬만 하면 더빙 트랙이 더 높아 오염된다). `gl`(지역)은 지역제한 영상을 깨뜨리므로 건드리지 않는다.
 
@@ -104,6 +202,11 @@ just_audio의 `play()`가 돌려주는 Future는 **재생이 시작될 때가 �
 |---|---|
 | 어떤 영상도 저장이 안 됨 / 매니페스트 실패 | 앱 코드보다 라이브러리 의심. `dart run tool/yt_probe.dart` → PROBE_FAIL이면 `youtube_explode_dart` 최신으로 업그레이드(유튜브 변경으로 주기적으로 깨진다). |
 | 특정 영상만 "모든 매니페스트 후보 실패 / no playable streams" | 대개 **막 끝난 라이브(post-live DVR)**. `videoDetails.isPostLiveDvr == true`가 신뢰 신호이며 `playabilityStatus.status`는 UNPLAYABLE↔OK로 토글되므로 판단 근거로 쓰면 안 된다. `_diagnoseUnavailable`가 이미 구분해 재시도 안내를 띄운다. 앱 버그 아님. |
+| 저장이 "준비 중"에서 오래 걸림 | 팝업의 단계 표시(영상 정보 → 스트림 찾는 중(ios/androidVr/default) → 스트림 확인 중 → 다운로드 시작 대기)와 `[BT] download.t:` 로그로 어느 단계인지 특정한다. 후보 하나가 실패하면 30초 타임아웃 → 다음 후보라, 최악의 경우 3×30초+진단 15초가 통째로 "준비 중"으로 보인다. `dart run tool/yt_repeat_probe.dart`로 라이브러리/유튜브 쪽인지 앱 쪽인지 가른다. |
+| 저장이 403으로 실패 | `from=0`이면 URL/세션 문제, **`from>0`이면 PO token 문제**(§2.3.2.1 — 첫 1MB만 받아진다). 후자는 `via=PAGE-CAPTURED` 응답을 못 쓴 것이므로, 웹뷰에서 그 영상을 재생해 페이지가 player 요청을 하게 만든 뒤 다시 저장하면 된다. `_chunkSize`가 1MB보다 커졌는지도 확인. |
+| 저장이 "다운로드 시작 대기 중"에서 영영 멈춤 | **매니페스트는 성공했는데 스트림 URL이 403인 경우.** youtube_explode는 이때 매니페스트 재조회 → 같은 URL 재시도를 로그도 예외도 없이 무한 반복한다(`YoutubeHttpClient._getStream`의 `while`). §2.8의 두 방어선(`_streamUrlWorks` 사전 검증, `_stallTimeout`)이 이미 막고 있으니, 다시 나타나면 그 둘이 지워졌는지부터 확인할 것. 어느 클라이언트의 URL이 죽었는지는 `dart run --define=VID=<videoId> tool/yt_repeat_probe.dart` 첫 섹션에 나온다. |
+| `RequestLimitExceededException: rate limiting` | 요청 URL을 볼 것. `GET /watch?v=…`이면 메타 조회(`videos.get`)가 막힌 것이고 **저장은 계속돼야 정상이다**(§2.3.4). 저장까지 실패했다면 메타 실패가 다시 치명적으로 취급되고 있는지 확인. 매니페스트 요청이 막힌 것이면 §2.3.3의 웹뷰 우회가 자동으로 돈다. |
+| "로그인하여 봇이 아님을 확인하세요" | 유튜브의 봇 확인(§2.3.3). 앱은 후보를 모두 시도한 뒤 웹뷰 세션 우회(`_resolveViaWebView`)를 한 번 더 타고, 그것도 실패하면 안내 팝업을 띄운다. 로그에서 `webview resolve 성공/실패`를 먼저 볼 것. 실패가 `no-audio`면 세 컨텍스트 모두 평문 `url`을 못 받은 것(웹뷰가 로그인/봇 확인 화면에 걸려 있을 수 있으니 웹뷰에서 영상이 실제로 재생되는지 확인). 봇 확인 자체는 IP 평판에 걸리므로 셀룰러↔Wi-Fi 전환도 유효한 확인 수단이다. |
 | 한국경제Live가 안 나옴 | `dart run tool/wowtv_live_probe.dart` — 3단계 중 어디서 끊겼는지 바로 나온다. `embed=null`이면 한경 페이지 개편(정규식 수정), `hlsManifestUrl 없음`이면 방송 중이 아니거나 유튜브 차단, `PROBE_OK`인데 앱만 안 되면 그때 앱 코드를 본다. |
 | 한국어 영상이 영어로 저장/재생됨 | `dart run --define=VID=<videoId> tool/yt_track_probe.dart` (‼️ `--define`은 파일 경로 **앞**에 와야 한다). |
 | 잠금화면 길이가 실제의 2배 | androidVr 스트림의 컨테이너 duration이 실제의 2배로 들어오는 결함. `SavedAudioPage._sourceFor`가 `ClippingAudioSource(end: item.duration)`로 보정한다 — 이 보정을 지우면 재발. |
@@ -127,6 +230,8 @@ flutter run --release           # vmService attach 없이 실기기 확인
 dart run tool/yt_probe.dart                              # 추출 라이브러리 생존 확인
 dart run --define=VID=<videoId> tool/yt_track_probe.dart  # 오디오 트랙(언어) 확인
 dart run tool/wowtv_live_probe.dart                      # 한국경제Live 3단계 확인
+dart run tool/yt_repeat_probe.dart                       # 연속 저장 재현 + 단계별 소요시간
+dart run --define=VID=<videoId> tool/yt_client_sweep.dart # 클라이언트 11종 전수 확인
 ```
 
 `tool/`의 스크립트는 flutter 의존 없이 도는 standalone이라 `live_service.dart`의 정규식·요청 형태를 복제해 두었다. 한쪽을 고치면 다른 쪽도 맞출 것.

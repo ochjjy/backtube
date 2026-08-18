@@ -1,7 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "Bash(PATH=/Users/michaelauk/work/kwic/flutter/flutter/bin:__TRACKED_VAR__ flutter analyze)"
+      "Bash(PATH=/Users/michaelauk/work/kwic/flutter/flutter/bin:__TRACKED_VAR__ flutter analyze)",
+      "Bash(PATH=/Users/michaelauk/work/kwic/flutter/flutter/bin:__TRACKED_VAR__ dart run tool/yt_repeat_probe.dart)"
     ]
   }
 }

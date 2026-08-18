@@ -145,6 +145,11 @@ class _WebViewPageState extends State<WebViewPage> {
   @override
   void initState() {
     super.initState();
+    // 기본값 그대로 둔다. 미디어 재생에 사용자 제스처가 필요한 상태이며,
+    // 그래야 사용자가 보는 화면에서 영상이 멋대로 자동재생되지 않는다.
+    // (자동재생을 켜서 숨은 웹뷰로 PO token을 수확하려던 시도는 제거했다.
+    //  iOS는 인라인 재생이 기본이 아니라 전체화면으로 떠 버렸고, 애초에 SABR
+    //  영상에서는 토큰을 얻을 수도 없었다. §2.3.2.2)
     _controller = WebViewController()
       ..setJavaScriptMode(JavaScriptMode.unrestricted)
       ..addJavaScriptChannel(_jsChannelName, onMessageReceived: (msg) async {
@@ -201,8 +206,19 @@ class _WebViewPageState extends State<WebViewPage> {
         },
       ))
       ..loadRequest(Uri.parse('https://m.youtube.com'));
+
   }
 
+  /// PO token 수확 전용 숨은 웹뷰.
+  ///
+  /// 메인 웹뷰와 분리하는 이유: 토큰을 만들려면 유튜브 플레이어가 **스스로**
+  /// 재생을 시작해야 하는데(그래야 미디어를 요청하고 그 URL에 토큰이 붙는다),
+  /// 그러려면 "재생에 사용자 제스처 불필요" 설정이 필요하다. 그 설정을 메인
+  /// 웹뷰에 걸면 사용자가 보는 화면에서 영상이 멋대로 재생된다. 그래서 이
+  /// 웹뷰에만 걸고, 화면에는 사실상 보이지 않게 깐다.
+  ///
+  /// 쿠키·localStorage는 WKWebsiteDataStore/CookieManager가 앱 안에서 공유되므로
+  /// 메인 웹뷰와 같은 세션이다 — 여기서 얻은 토큰을 그대로 쓸 수 있다.
   Future<String?> _currentVideoId() async {
     final videoId = await _controller.runJavaScriptReturningResult(r'''
       (function() {
@@ -557,6 +573,48 @@ class _WebViewPageState extends State<WebViewPage> {
     window.__btAuth = a;
     try { localStorage.setItem('__btAuth', JSON.stringify(a)); } catch(e){}
   }
+  // SABR(`videoplayback?...&sabr=1`)는 POST 본문(protobuf)에 PO token을 싣는다.
+  // URL에는 토큰이 없으므로(실기기 실측 2026-08-18: shapes에 sabr은 있고
+  // itag/mime/clen/range가 없음) 본문에서 뽑는 수밖에 없다. protobuf를 제대로
+  // 파싱하는 대신, 토큰이 긴 base64url 문자열이라는 점을 이용해 본문에서 가장
+  // 긴 base64url 구간을 찾는다.
+  function tokenFromBinary(buf){
+    try {
+      var b = new Uint8Array(buf);
+      var best = '', cur = '';
+      for (var i = 0; i < b.length; i++) {
+        var ch = b[i];
+        var ok = (ch >= 48 && ch <= 57) || (ch >= 65 && ch <= 90) ||
+                 (ch >= 97 && ch <= 122) || ch === 45 || ch === 95 || ch === 61;
+        if (ok) {
+          cur += String.fromCharCode(ch);
+        } else {
+          if (cur.length > best.length) best = cur;
+          cur = '';
+        }
+      }
+      if (cur.length > best.length) best = cur;
+      // PO token은 보통 100자를 훌쩍 넘는다. 짧은 건 다른 필드다.
+      return best.length >= 80 ? best : null;
+    } catch(e){ return null; }
+  }
+  function rememberSabrBody(body){
+    try {
+      if (!body || window.__btAuth) return;
+      if (typeof body === 'string') return;
+      var buf = body.buffer ? body.buffer : body;
+      if (!(buf instanceof ArrayBuffer)) return;
+      var tok = tokenFromBinary(buf);
+      if (tok) {
+        saveAuth({poToken: tok, visitorData: null, t: Date.now(), src: 'sabr'});
+      }
+    } catch(e){}
+  }
+  function isSabr(u){
+    u = u || '';
+    return u.indexOf('videoplayback') >= 0 && u.indexOf('sabr') >= 0;
+  }
+
   function rememberAuth(body){
     try {
       if (!body || typeof body !== 'string') return;
@@ -582,7 +640,7 @@ class _WebViewPageState extends State<WebViewPage> {
       return m ? m[1] : null;
     } catch(e){ return null; }
   }
-  function rememberMedia(u){
+  function rememberMedia(u, forceVid){
     try {
       if (!u || u.indexOf('googlevideo.com') < 0 ||
           u.indexOf('videoplayback') < 0) return;
@@ -606,7 +664,7 @@ class _WebViewPageState extends State<WebViewPage> {
       // 피드에서 인라인 재생하면 주소에 v= 가 없다. 그때는 '_last'에 담아 두고,
       // 해석 시 기대 크기(clen)가 일치할 때만 쓴다(다른 영상 오디오를 저장하는
       // 사고를 막는다).
-      var vid = currentVid() || '_last';
+      var vid = forceVid || currentVid() || '_last';
       if (!window.__btMedia[vid]) window.__btMedia[vid] = {};
       window.__btMedia[vid][p.itag] = {
         url: u.slice(0, qi) + '?' + kept.join('&'),
@@ -635,6 +693,13 @@ class _WebViewPageState extends State<WebViewPage> {
       var u = (typeof input === 'string') ? input : ((input && input.url) || '');
       var p = of.apply(this, arguments);
       rememberMedia(u);
+      if (isSabr(u)) {
+        try {
+          var sb = (init && init.body) ||
+              (input && typeof input !== 'string' && input.body) || null;
+          rememberSabrBody(sb);
+        } catch(e){}
+      }
       if (isPlayer(u)) {
         try {
           var body = (init && init.body) ||
@@ -662,6 +727,7 @@ class _WebViewPageState extends State<WebViewPage> {
   XMLHttpRequest.prototype.send = function(body){
     var self = this;
     try { if (isPlayer(this.__btUrl)) rememberAuth(body); } catch(e){}
+    try { if (isSabr(this.__btUrl)) rememberSabrBody(body); } catch(e){}
     try {
       this.addEventListener('load', function(){
         try { if (isPlayer(self.__btUrl)) remember(self.responseText); } catch(e){}
@@ -720,6 +786,11 @@ class _WebViewPageState extends State<WebViewPage> {
       }
     } catch(e){}
   }
+  // 해석 스크립트(_playerProbeJs)가 재사용할 수 있게 노출한다. 두 스크립트는
+  // 같은 window에서 돌지만 각자 IIFE라 지역 함수는 공유되지 않는다.
+  window.__btSaveAuth = saveAuth;
+  window.__btRememberMedia = rememberMedia;
+
   sweep();
   setInterval(sweep, 2000);
 })();
@@ -812,16 +883,17 @@ class _WebViewPageState extends State<WebViewPage> {
     _playerProbe = completer;
     try {
       await _controller.runJavaScript(_playerProbeJs(videoId, expectSize));
-      final raw = await completer.future.timeout(const Duration(seconds: 25));
+      final raw = await completer.future.timeout(const Duration(seconds: 40));
       final data = jsonDecode(raw) as Map<String, dynamic>;
       if (data['ok'] != true) {
         _btLog('webview resolve 실패: ${data['reason']} [${data['diag']}]');
         return null;
       }
       final url = data['url'] as String?;
-      if (url == null || url.isEmpty) return null;
-      _btLog('webview resolve 성공: via=${data['via']} '
+      final via = (data['via'] as String?) ?? 'webview';
+      _btLog('webview resolve 성공: via=$via '
           'status=${data['status']} size=${data['size']} [${data['diag']}]');
+      if (url == null || url.isEmpty) return null;
       final seconds = (data['seconds'] as num?)?.toInt() ?? 0;
       final title = (data['title'] as String?) ?? '';
       final author = (data['author'] as String?) ?? '';
@@ -829,7 +901,7 @@ class _WebViewPageState extends State<WebViewPage> {
         url: Uri.parse(url),
         sizeBytes: (data['size'] as num?)?.toInt() ?? 0,
         mimeType: (data['mime'] as String?) ?? '',
-        via: (data['via'] as String?) ?? 'webview',
+        via: via,
         title: title.isEmpty ? null : title,
         author: author.isEmpty ? null : author,
         duration: seconds > 0 ? Duration(seconds: seconds) : null,
@@ -929,56 +1001,59 @@ class _WebViewPageState extends State<WebViewPage> {
     pool.sort(function(a,b){ return (b.bitrate||0) - (a.bitrate||0); });
     return pool[0];
   }
-  // ⓪ 플레이어가 지금 재생에 쓰고 있는 미디어 URL이 잡혀 있으면 그것이 정답이다.
-  //    서명·n·PO token이 이미 유효하게 붙어 있어 range 제한에 걸리지 않는다.
-  //    오디오 전용 itag 우선순위: 140(m4a 128k) → 141(256k) → 139(48k).
-  try {
-    var store = window.__btMedia || {};
-    var med = store[VIDEO];
-    // 피드에서 인라인 재생하면 주소에 v= 가 없어 '_last'에 담긴다. 그 경우
-    // **기대 크기(clen)가 정확히 일치할 때만** 쓴다 — 다른 영상의 오디오를
-    // 저장하는 사고를 막기 위한 유일한 확인 수단이다.
-    if (!med && EXPECT > 0 && store._last) {
-      var cand = {};
-      for (var t in store._last) {
-        if (store._last[t] && store._last[t].clen === EXPECT) cand[t] = store._last[t];
+  // ⓪ 플레이어가 재생에 쓰던 미디어 URL이 잡혀 있으면 그것이 정답이다.
+  //    단 **`pot`이 붙어 있을 때만** 그렇다. 토큰 없는 미디어 URL은 우리가 직접
+  //    만든 URL과 똑같이 첫 1MB에서 막히므로(실측 2026-08-18: `mkeys`에 pot이
+  //    없는 URL이 1MB에서 403) 여기서 쓰면 안 된다.
+  function pickMedia(requirePot){
+    try {
+      var store = window.__btMedia || {};
+      var med = store[VIDEO];
+      // 피드 인라인 재생은 주소에 v= 가 없어 '_last'에 담긴다. 기대 크기가
+      // 정확히 일치할 때만 쓴다(다른 영상 오디오를 저장하는 사고 방지).
+      if (!med && EXPECT > 0 && store._last) {
+        var cand = {};
+        for (var t in store._last) {
+          if (store._last[t] && store._last[t].clen === EXPECT) cand[t] = store._last[t];
+        }
+        if (Object.keys(cand).length) { med = cand; diag.medsrc = 'last'; }
       }
-      if (Object.keys(cand).length) { med = cand; diag.medsrc = 'last'; }
-    }
-    if (med) {
+      if (!med) return null;
       diag.media = Object.keys(med).join('/') || 'empty';
       var order = ['140', '141', '139'];
-      var chosen = null, chosenTag = null;
+      var list = [];
       for (var oi = 0; oi < order.length; oi++) {
-        if (med[order[oi]] && med[order[oi]].url) {
-          chosen = med[order[oi]]; chosenTag = order[oi]; break;
+        if (med[order[oi]]) list.push([order[oi], med[order[oi]]]);
+      }
+      for (var tag in med) {
+        if ((med[tag].mime || '').indexOf('audio') === 0 && order.indexOf(tag) < 0) {
+          list.push([tag, med[tag]]);
         }
       }
-      // 목록에 없는 오디오 itag라도 mime이 audio면 받아들인다.
-      if (!chosen) {
-        for (var tag in med) {
-          if (med[tag] && med[tag].url &&
-              (med[tag].mime || '').indexOf('audio') === 0) {
-            chosen = med[tag]; chosenTag = tag; break;
-          }
-        }
+      for (var li = 0; li < list.length; li++) {
+        var m = list[li][1];
+        if (!m || !m.url) continue;
+        var hasPot = m.url.indexOf('pot=') >= 0;
+        if (requirePot && !hasPot) continue;
+        return {tag: list[li][0], m: m, pot: hasPot};
       }
-      if (chosen) {
-        diag.mkeys = chosen.keys || '?';
-        diag.morig = chosen.orig || '-';
-        diag.msp = chosen.sp || '-';
-        post({
-          ok: true, via: 'MEDIA-' + chosenTag, status: 'OK', diag: diagText(),
-          url: chosen.url,
-          size: chosen.clen || 0,
-          mime: chosen.mime || 'audio/mp4',
-          title: '', author: '',
-          seconds: Math.round(chosen.dur || 0)
-        });
-        return;
-      }
-    }
-  } catch(e){}
+    } catch(e){}
+    return null;
+  }
+  function postMedia(sel, via){
+    diag.mkeys = sel.m.keys || '?';
+    diag.mpot = sel.pot ? 'O' : 'X';
+    post({
+      ok: true, via: via + '-' + sel.tag, status: 'OK', diag: diagText(),
+      url: sel.m.url,
+      size: sel.m.clen || 0,
+      mime: sel.m.mime || 'audio/mp4',
+      title: '', author: '',
+      seconds: Math.round(sel.m.dur || 0)
+    });
+  }
+  var potMedia = pickMedia(true);
+  if (potMedia) { postMedia(potMedia, 'MEDIA'); return; }
 
   // ① 페이지가 스스로 받아 둔 응답이 있으면 그것을 최우선으로 쓴다.
   //    이 URL에만 PO token이 붙어 있어 **끝까지** 받을 수 있다.
@@ -1111,9 +1186,22 @@ class _WebViewPageState extends State<WebViewPage> {
       });
     }).catch(function(){ tryAt(i + 1); });
   }
-  // ①(가로채기·초기응답)이 위에서 이미 post 했으면 여기까지 오지 않는다.
-  // ② watch 페이지 → 실패하면 ③ 우리가 직접 부르는 InnerTube 순.
-  fromWatchPage(function(){ tryAt(0); });
+  function proceed(){
+    auth = window.__btAuth || auth;
+    diag.pot = auth ? 'O' : 'X';
+    // 토큰이 붙은 미디어 URL이 잡혀 있으면 그게 최선이다.
+    var sel = pickMedia(true);
+    if (sel) { postMedia(sel, 'IFRAME-MEDIA'); return; }
+    fromWatchPage(function(){
+      // 사용자가 그 영상을 **직접 재생**해서 잡힌 미디어 URL이 있으면, 토큰이
+      // 안 보이더라도 우리가 만든 URL보다 먼저 시도한다. 실제 재생 세션에서
+      // 나온 URL이라 우리가 만든 것과 성질이 다를 수 있다.
+      var played = pickMedia(false);
+      if (played) { postMedia(played, 'MEDIA-PLAYED'); return; }
+      tryAt(0);
+    });
+  }
+  proceed();
 })();
 ''';
 

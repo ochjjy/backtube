@@ -341,29 +341,31 @@ class DownloadService {
       //   썸네일 → i.ytimg.com 고정 규칙. (§2.3.4)
       AudioOnlyStreamInfo? audio;
       ResolvedAudioStream? viaWebView;
-      try {
-        audio = await _resolveAudioStream(yt, videoId, onStage: onStage);
-      } on AudioUnavailableException catch (e) {
-        // 봇 확인·rate limit으로 막힌 경우에만 웹뷰 세션으로 한 번 더. 다른
-        // 사유(비공개, 처리 중 등)는 세션을 바꿔도 결과가 같으므로 그대로 올린다.
-        if (!e.botBlocked || resolveViaWebView == null) rethrow;
-        debugPrint('[BT] download: 차단 감지 → 웹뷰 세션 우회 시도');
-        onStage?.call('웹뷰 세션으로 다시 시도 중...');
-        throwIfCancelled();
-        viaWebView = await resolveViaWebView(videoId);
-        if (viaWebView == null) rethrow;
-        debugPrint('[BT] download: 웹뷰 세션 우회 성공 via=${viaWebView.via} '
-            'size=${viaWebView.sizeBytes} mime=${viaWebView.mimeType}');
+      if (!_preferMuxed) {
+        try {
+          audio = await _resolveAudioStream(yt, videoId, onStage: onStage);
+        } on AudioUnavailableException catch (e) {
+          // 봇 확인·rate limit으로 막힌 경우에만 웹뷰 세션으로 한 번 더. 다른
+          // 사유(비공개, 처리 중 등)는 세션을 바꿔도 결과가 같으므로 그대로 올린다.
+          if (!e.botBlocked || resolveViaWebView == null) rethrow;
+          debugPrint('[BT] download: 차단 감지 → 웹뷰 세션 우회 시도');
+          onStage?.call('웹뷰 세션으로 다시 시도 중...');
+          throwIfCancelled();
+          viaWebView = await resolveViaWebView(videoId);
+          if (viaWebView == null) rethrow;
+          debugPrint('[BT] download: 웹뷰 세션 우회 성공 via=${viaWebView.via} '
+              'size=${viaWebView.sizeBytes} mime=${viaWebView.mimeType}');
+        }
+        debugPrint('[BT] download.t: manifest=${lap()}ms');
       }
-      debugPrint('[BT] download.t: manifest=${lap()}ms');
 
       throwIfCancelled();
       onStage?.call('다운로드 시작 대기 중...');
-      var sourceUrl = viaWebView?.url ?? audio!.url;
-      var total = viaWebView?.sizeBytes ?? audio!.size.totalBytes;
-      if (viaWebView == null) {
+      var sourceUrl = viaWebView?.url ?? audio?.url ?? Uri.parse('about:blank');
+      var total = viaWebView?.sizeBytes ?? audio?.size.totalBytes ?? 0;
+      if (viaWebView == null && audio != null) {
         // 참고: 명목 비트레이트로 계산한 예상 길이. 실제 스트림 길이와 비교용.
-        final approxSeconds = audio!.bitrate.bitsPerSecond > 0
+        final approxSeconds = audio.bitrate.bitsPerSecond > 0
             ? (total * 8 / audio.bitrate.bitsPerSecond).round()
             : 0;
         debugPrint('[BT] download stream ${audio.container.name}/'
@@ -398,10 +400,23 @@ class DownloadService {
         // 패키지가 비디오 스트림 HEAD 403 때문에 버린 클라이언트를 직접 살린다.
         ('직접 androidVr', () => _viaInnerTube(videoId, 'androidVr', _ctxAndroidVr)),
         ('직접 ios', () => _viaInnerTube(videoId, 'ios', _ctxIos)),
+        // 마지막 보루: progressive itag 18(360p 영상+AAC 합본). 오디오 전용
+        // 포맷이 전부 PO token에 막혀도 **이것만은 끝까지 받아진다**(§2.3.2.4).
+        // 영상이 섞여 있어 용량이 늘지만, 저장이 되는 쪽이 낫다.
+        ('합본 itag18', () => _viaInnerTube(videoId, 'muxed18', _ctxAndroid,
+            muxed: true)),
       ];
 
       var received = 0;
       var done = false;
+      // 첫 1MB만 받고 403이 나면 PO token 제한이다(§2.3.2.1).
+      //
+      // 이때 **어느 클라이언트가 막혔는지**(URL의 `c=` 값)만 기억한다. 예전에는
+      // 한 번 막히면 토큰 없는 후보를 전부 건너뛰었는데, 제한은 (클라이언트 ×
+      // 영상 × 세션)마다 걸리는 것이라 **다른 클라이언트가 되는 영상까지 놓쳤다**
+      // (리스트에서 되던 저장이 안 되게 된 원인). 같은 클라이언트만 건너뛴다.
+      final cappedClients = <String>{};
+      String clientOf(Uri u) => u.queryParameters['c'] ?? '?';
       ResolvedAudioStream? lastSource = viaWebView;
       // 이미 웹뷰로 해석해 둔 것이 있으면 그것부터.
       final ordered = viaWebView != null
@@ -412,6 +427,23 @@ class DownloadService {
         throwIfCancelled();
         final src = await resolve();
         if (src == null) continue;
+        // 같은 클라이언트가 이미 1MB에서 막혔고 토큰도 없으면 결과가 같다.
+        // 사용자가 직접 재생해서 잡힌 URL(MEDIA*)은 실제 재생 세션에서 나온
+        // 것이라 성질이 다를 수 있으므로 언제나 한 번은 받아 본다.
+        final fromPlayback = src.via.startsWith('MEDIA');
+        // itag 18(합본)은 같은 ANDROID 클라이언트로 받지만 **제한 대상이
+        // 아니다** — 오디오 전용 포맷만 토큰을 요구한다(§2.3.2.4). 클라이언트가
+        // 막혔다는 이유로 건너뛰면 이 마지막 보루를 잃는다.
+        final isMuxed = src.via.contains('muxed');
+        final client = clientOf(src.url);
+        if (!fromPlayback &&
+            !isMuxed &&
+            cappedClients.contains(client) &&
+            !src.url.toString().contains('pot=')) {
+          debugPrint('[BT] download: [$label] $client는 이미 1MB에서 막힘 → 건너뜀');
+          lastSource ??= src;
+          continue;
+        }
         lastSource = src;
         sourceUrl = src.url;
         if (src.sizeBytes > 0) total = src.sizeBytes;
@@ -420,7 +452,9 @@ class DownloadService {
           viaWebView = src;
         }
         debugPrint('[BT] download: 시도 [$label] size=$total');
-        onStage?.call('다운로드 중 ($label)...');
+        onStage?.call(isMuxed
+            ? '오디오 전용이 막혀 합본으로 받는 중...'
+            : '다운로드 중 ($label)...');
         try {
           received = await _downloadToFile(
             tmp,
@@ -432,12 +466,20 @@ class DownloadService {
           done = true;
           break;
         } on _StreamForbidden {
-          debugPrint('[BT] download: [$label] 403으로 중단 → 다음 후보');
+          if (received == 0) cappedClients.add(clientOf(sourceUrl));
+          debugPrint('[BT] download: [$label] 403으로 중단 → 다음 후보 '
+              '(막힌 클라이언트: ${cappedClients.join(",")})');
         }
       }
 
       // 앱의 HTTP 요청이 어느 URL로도 안 되면 마지막으로 **웹뷰 안에서** 받는다.
-      if (!done && downloadChunkViaWebView != null && lastSource != null) {
+      // 토큰이 붙어 있거나, 사용자가 직접 재생해서 잡힌 URL일 때만 의미가 있다
+      // (그 외에는 웹뷰에서 받아도 똑같이 1MB에서 막히는 것을 실측했다).
+      if (!done &&
+          downloadChunkViaWebView != null &&
+          lastSource != null &&
+          (lastSource.url.toString().contains('pot=') ||
+              lastSource.via.startsWith('MEDIA'))) {
         throwIfCancelled();
         debugPrint('[BT] download: 모든 후보 403 → 웹뷰 안에서 직접 받기');
         onStage?.call('웹뷰에서 받는 중...');
@@ -460,9 +502,9 @@ class DownloadService {
 
       if (!done) {
         throw const AudioUnavailableException(
-          '유튜브가 이 영상의 다운로드를 첫 1MB로 제한했습니다.\n'
-          '웹뷰에서 그 영상을 재생한 상태로 다시 저장해 주세요\n'
-          '(재생 중에만 제한을 푸는 토큰을 얻을 수 있습니다).',
+          '유튜브가 이 영상은 첫 1MB만 내주고 있습니다.\n'
+          '유튜브가 이 영상에 새 전송 방식(SABR)을 적용해서,\n'
+          '지금은 앱에서 받을 방법이 없습니다. 다른 영상은 정상 저장됩니다.',
           retryable: true,
           botBlocked: true,
         );
@@ -555,9 +597,13 @@ class DownloadService {
     // 되는 URL을 준다(실기기 2026-08-18: androidVr로 14.8MB 완주, android는 매번
     // 1MB에서 403 — §2.3.2.1). ios는 그다음, android/default는 사실상 1MB만
     // 받아지므로 맨 뒤의 형식적 후보다.
+    //
+    // `ios`는 여기서 빼 두었다. 패키지가 매니페스트를 받은 뒤 **비디오** 스트림에
+    // HEAD를 날려 403이면 후보를 통째로 버리는데(itag 137/299 — 오디오와 무관),
+    // 실기기에서 매번 8~10초를 쓰고 항상 그 이유로 실패했다. 같은 클라이언트를
+    // `_viaInnerTube`가 그 검사 없이 다시 시도하므로 잃는 것도 없다.
     final attempts = <(String, List<YoutubeApiClient>?)>[
       ('androidVr', [withAudioLanguage(YoutubeApiClient.androidVr)]),
-      ('ios', [withAudioLanguage(YoutubeApiClient.ios)]),
       ('android', [withAudioLanguage(YoutubeApiClient.android)]),
       ('default', null),
     ];
@@ -628,11 +674,18 @@ class DownloadService {
   /// 스트림이라(실측: `returned 403 (stream: 137)` — itag 137은 1080p 비디오)
   /// 오디오는 멀쩡한데도 클라이언트가 통째로 탈락한다. 우리는 오디오만 필요하니
   /// 그 판정을 따를 이유가 없다.
+  ///
+  /// [muxed]면 `adaptiveFormats` 대신 `formats`(progressive)에서 **itag 18**을
+  /// 고른다. itag 18은 360p H.264 + AAC를 하나로 합친 옛 포맷인데, 유튜브가
+  /// PO token을 요구하는 지금도 **토큰 없이 끝까지 받아지는 유일한 포맷**이다
+  /// (§2.3.2.4). 오디오만 필요한 우리에겐 비디오가 낭비지만, 받히지 않는 것보다
+  /// 낫다. 컨테이너가 mp4/AAC라 iOS AVPlayer가 그대로 재생한다(§2.2).
   static Future<ResolvedAudioStream?> _viaInnerTube(
     String videoId,
     String label,
-    Map<String, dynamic> client,
-  ) async {
+    Map<String, dynamic> client, {
+    bool muxed = false,
+  }) async {
     final http = HttpClient();
     try {
       final uri = Uri.parse(
@@ -657,15 +710,20 @@ class DownloadService {
           jsonDecode(await resp.transform(utf8.decoder).join()) as Map<String, dynamic>;
       final status =
           (json['playabilityStatus'] as Map<String, dynamic>?)?['status'];
-      final formats = ((json['streamingData']
-              as Map<String, dynamic>?)?['adaptiveFormats'] as List<dynamic>?) ??
-          const [];
+      final streaming = json['streamingData'] as Map<String, dynamic>?;
+      // 삼항 안에서 `?[`를 쓰면 Dart 파서가 삼항의 `?`와 헷갈리므로 풀어 쓴다.
+      final Object? rawFormats = streaming == null
+          ? null
+          : (muxed ? streaming['formats'] : streaming['adaptiveFormats']);
+      final formats = (rawFormats as List<dynamic>?) ?? const [];
       // 서명이 걸린(url 없는) 포맷은 JS 솔버 없이 못 쓰므로 제외한다.
       final audio = formats
           .cast<Map<String, dynamic>>()
           .where((f) =>
               f['url'] != null &&
-              (f['mimeType'] as String? ?? '').startsWith('audio/mp4'))
+              (muxed
+                  ? f['itag'] == 18
+                  : (f['mimeType'] as String? ?? '').startsWith('audio/mp4')))
           .toList();
       if (audio.isEmpty) {
         debugPrint('[BT] innertube[$label]: $status, 평문 오디오 없음');
@@ -683,7 +741,8 @@ class DownloadService {
       final details = json['videoDetails'] as Map<String, dynamic>?;
       final seconds = int.tryParse('${details?['lengthSeconds']}') ?? 0;
       debugPrint('[BT] innertube[$label]: $status itag=${best['itag']} '
-          'size=${best['contentLength']}');
+          'size=${best['contentLength'] ?? "(미제공)"} '
+          '${muxed ? "(영상 포함 progressive)" : ""}');
       return ResolvedAudioStream(
         url: Uri.parse(best['url'] as String),
         sizeBytes: int.tryParse('${best['contentLength']}') ?? 0,
@@ -711,6 +770,15 @@ class DownloadService {
     'androidSdkVersion': 32,
     'osName': 'Android',
     'osVersion': '12',
+    'hl': kPreferredAudioLanguage,
+    'gl': 'KR',
+  };
+
+  static const Map<String, dynamic> _ctxAndroid = {
+    '_num': 3,
+    'clientName': 'ANDROID',
+    'clientVersion': '20.10.38',
+    'androidSdkVersion': 30,
     'hl': kPreferredAudioLanguage,
     'gl': 'KR',
   };

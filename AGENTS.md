@@ -108,7 +108,7 @@
 
 | 클라이언트 | 결과 |
 |---|---|
-| **ANDROID_VR** | PO token 없이 **전체 다운로드 가능한 유일한 클라이언트**(다른 영상에서 14.8MB 완주 확인). 단 영상에 따라 `LOGIN_REQUIRED` |
+| **ANDROID_VR** | PO token 없이 **전체 다운로드 가능한 유일한 클라이언트**. 단 영상에 따라 `LOGIN_REQUIRED`가 나며, 그런 영상은 토큰 없이는 방법이 없다. 앱 밖(Dart)에서는 막혀도 **웹뷰 안에서 부르면 통과하는 경우가 있다**(실기기 2026-08-18: `it_ANDROID_VR=2개` → 완주). 그래서 in-page 시도 목록의 첫 번째다 |
 | ANDROID / IOS | 오디오는 나오지만 1조각 200 → **2조각 403, 20MB지점 403** |
 | ANDROID_MUSIC·ANDROID_CREATOR·IOS_MUSIC·IOS_CREATOR·TVHTML5 | `LOGIN_REQUIRED` |
 | MWEB / WEB | `UNPLAYABLE` |
@@ -120,23 +120,47 @@
 
 **로그인 없이 푸는 길은 PO token 수확이다.** 이 영상은 `hlsManifestUrl`도 `dashManifestUrl`도 없고 `serverAbrStreamingUrl`(SABR)만 있다 — 즉 유튜브가 PO token을 전제로 전달한다. 그런데 그 토큰은 **로그인과 무관하게 페이지의 BotGuard가 만든다**. 웹 플레이어가 로그인 없이 102분짜리를 재생한다는 것이 그 증거다. 그래서 `_injectPlayerCapture`는 Resource Timing에서 `pot=`가 실린 googlevideo 요청을 찾아 토큰을 `window.__btAuth`에 담고, `_resolveViaWebView`는 그것을 ⑴ 우리 InnerTube 요청 본문(`serviceIntegrityDimensions.poToken`)과 ⑵ 응답으로 받은 스트림 URL(`&pot=`) 양쪽에 붙인다. 토큰은 세션(visitorData)에 묶이므로 **반드시 페이지의 visitorData와 짝지어** 보내야 한다.
 
-토큰은 **재생 중에만** 나타난다(플레이어가 미디어를 요청해야 생긴다). 그래서 사용자 안내가 "웹뷰에서 그 영상을 재생한 상태로 다시 저장"이다.
+**재생 없이 토큰을 얻으려던 시도는 모두 실패했고 코드에서 제거했다.** 기록만 남긴다:
 
-이전 실기기 실측:
-
-| 클라이언트 | 결과 |
+| 시도 | 결과 |
 |---|---|
-| **androidVr** | 전체 완주 (14.8MB) ✅ |
-| android / default(androidSdkless) | 매번 1MB에서 403 |
-| ios | 패키지가 후보 자체를 버림(아래) |
+| 토큰을 `localStorage`에 보존해 재사용 | 애초에 토큰을 한 번도 못 얻어 의미 없었다 |
+| 숨은 iframe(watch 페이지는 `SAMEORIGIN`이라 프레이밍 가능) | 메인 웹뷰는 자동재생이 막혀 있어 재생이 시작되지 않음 |
+| 자동재생 허용 전용 숨은 웹뷰(`mediaTypesRequiringUserAction: {}`) | 재생은 됐지만(`video=playing:17`) **iOS는 인라인 재생이 기본이 아니라 전체화면으로 떠 버렸다**(`allowsInlineMediaPlayback` 미설정). 게다가 앱 시작과 동시에 웹뷰 두 개를 띄우면 메인 페이지가 검은 화면이 된다 |
+| 제3 프론트엔드(Piped 4곳 · Invidious 3곳) | 전부 HTTP 401/403/500/502 — 공개 인스턴스가 죽었거나 차단됨 |
 
-그래서 `_resolveAudioStream`의 후보 순서는 **androidVr가 첫 번째**다. 바꾸지 말 것.
+되살릴 거라면 `allowsInlineMediaPlayback: true`가 필수이고, 그래도 SABR 영상에서는 토큰을 얻지 못한다(§2.3.2.2).
 
-진단이 오래 걸린 이유: ⑴ 1KB 사전 검증은 항상 통과하고, ⑵ 3.4MB짜리 짧은 영상은 조각 크기가 전체 크기로 줄어 우연히 성공하며, ⑶ 봇 확인 메시지와 겹쳐 IP 평판 문제로 오인하기 쉽다. **`from > 0`에서 나는 403은 PO token 문제다.** URL을 새로 발급받아 이어받는 것도 소용없다(실측 — 제한은 URL이 아니라 세션에 걸린다).
+### 2.3.2.3 SABR 적용 범위가 넓어지고 있다 (2026-08-19 관측)
+**같은 영상이 며칠 사이에 되던 것에서 안 되는 것으로 바뀐다.** 2026-08-18에 `androidVr`로 완주했던 영상들이 2026-08-19에는 같은 클라이언트에서 `LOGIN_REQUIRED`가 됐다:
 
-**`ios`가 늘 탈락하는 이유는 따로 있다.** `getManifest`는 매니페스트를 받은 뒤 `streams.first`에 HEAD를 날려 403이면 후보 전체를 버리는데, `streams.first`는 보통 **비디오** 스트림이다(실측: `returned 403 (stream: 137)` — itag 137은 1080p 비디오). 오디오는 멀쩡한데 통째로 탈락한다. 그래서 `_viaInnerTube`가 패키지를 거치지 않고 InnerTube를 직접 불러 오디오만 고르는 후보를 따로 만든다.
+| videoId | 8/18 | 8/19 |
+|---|---|---|
+| `rtkzDogYxUU` (14.8MB, 완주 성공) | androidVr OK | **`LOGIN_REQUIRED`** |
+| `7cPsxE841Yc` (1.5MB, 완주 성공) | androidVr OK | **`LOGIN_REQUIRED`** |
+| `dQw4w9WgXcQ` (오래된 인기 영상) | OK | **OK, 2조각도 200** |
 
-**403을 만나면 다음 후보 URL로 갈아탄다.** 순서: 매니페스트 → 직접 androidVr → 직접 ios → 웹뷰 세션 → (그래도 안 되면) 웹뷰 안에서 직접 받기. 하나가 1MB에서 끊겼다고 저장을 포기하지 않는다.
+즉 ⑴ 제한은 IP가 아니라 **영상마다** 걸리고(같은 시각 같은 회선에서 `dQw4w9WgXcQ`는 android/androidVr 모두 정상, 1MB 너머도 받아진다), ⑵ 대상 영상이 **시간이 지나며 늘고 있다**. 최근 업로드된 뉴스/시사 영상이 먼저 걸리는 경향으로 보인다.
+
+**그래서 "어제는 됐는데 오늘은 안 된다"는 앱 회귀가 아니다.** 코드를 의심하기 전에 `dQw4w9WgXcQ` 같은 대조군 영상으로 한 번 확인할 것 — 그게 되면 앱은 정상이고 해당 영상이 새로 걸린 것이다.
+
+### 2.3.2.4 itag 18(합본)은 PO token 없이도 끝까지 받아진다 — 현재의 해법
+yt-dlp 쪽 자료(이슈 #17348, PO Token Guide)에서 **"토큰이 없으면 format 18만 남는다"**는 서술을 보고 실측한 결과, **이것이 유일하게 살아 있는 경로다.**
+
+itag 18 = 360p H.264 + AAC-LC가 하나로 합쳐진(muxed/progressive) mp4. 실측(2026-08-19, 오디오 전용이 전부 1MB에서 막히던 영상들):
+
+| 영상 | itag18 크기 | 통짜 다운로드(`Range: bytes=0-`) |
+|---|---|---|
+| VOA 뉴스 15분 | 12.7MB | ✅ 바이트 일치 |
+| 시사 **108분** | 264MB | ✅ 바이트 일치(84초) |
+| 뉴스 2분 | 3.8MB | ✅ |
+
+- **1MB 제한이 없다.** 마지막 조각까지 200이 나온다.
+- 컨테이너는 `ftypmp42`, 코덱은 `avc1.42001E, mp4a.40.2` — AAC라 iOS AVPlayer가 그대로 재생한다(§2.2). 저장 확장자는 `.m4a` 그대로 두어도 문제없다.
+- `contentLength`를 안 주는 영상이 있다 → `total=0`으로 열린 range(`0-`)를 쓰면 전체가 받아진다.
+- 대가는 **용량**이다. 영상이 섞여 있어 오디오 전용보다 크다(짧은 뉴스는 비슷하거나 오히려 작고, 긴 영상은 2~3배). 오디오 품질도 `AUDIO_QUALITY_LOW`(AAC 약 96kbps)로 itag 140(128kbps)보다 낮다. 말소리 위주 콘텐츠에는 충분하다.
+
+그래서 후보 목록의 **맨 마지막**에 둔다. 오디오 전용이 되면 그쪽이 우선이고, 전부 막혔을 때만 합본으로 받는다. `cappedClients`(§2.3.2.2)에 ANDROID가 들어 있어도 **itag 18은 건너뛰지 않는다** — 토큰을 요구하는 것은 오디오 전용 포맷뿐이다.
 
 ### 2.3.3 봇 확인("로그인하여 봇이 아님을 확인하세요") 우회는 웹뷰 세션이다
 유튜브가 봇 확인을 걸면 앱이 Dart에서 보내는 InnerTube 요청은 **어떤 클라이언트로도** 뚫리지 않는다. 실측(2026-08-17, `tool/yt_client_sweep.dart`): 패키지가 주는 11종 중 매니페스트가 나오는 것은 ios·androidVr·android·androidSdkless 넷뿐이고, 나머지(safari/mweb/tv/tvSimplyEmbedded/webCreator/mediaConnect/androidMusic)는 **봇 확인이 걸리지 않은 IP에서도** 전부 실패한다(유튜브가 인증을 요구하도록 바꿨고, 패키지도 셋을 `@Deprecated`로 표시했다). 클라이언트를 더 추가하는 건 우회책이 아니다.
@@ -144,7 +168,8 @@
 대신 앱에는 **이미 봇 확인을 통과한 세션**이 있다 — 사용자가 유튜브를 보던 웹뷰다. `main.dart`의 `_resolveViaWebView`가 그 안에서 스트림 URL을 받아 오고(같은 출처라 쿠키·visitorData가 자동으로 실린다 — 앱이 쿠키를 직접 다루지 않는다), 다운로드만 앱이 한다. 어느 경로든 **`url` 필드가 있는 포맷만** 고른다(`signatureCipher`는 JS 솔버 없이 못 푼다).
 
 해석 순서(앞이 성공하면 뒤는 시도하지 않는다):
-0. **`MEDIA-<itag>` — 플레이어가 지금 재생에 쓰고 있는 미디어 URL.** 가장 확실하다. `_injectPlayerCapture`가 **Resource Timing**(`performance.getEntriesByType('resource')`)·fetch/XHR·`<video>` 엘리먼트 세 곳에서 `googlevideo.com/videoplayback` URL을 주워 videoId·itag별로 모아 둔다. **Resource Timing이 핵심이다** — 실측(2026-08-18) `video=blob:`(MSE 재생 중)인데도 fetch/XHR 훅에는 아무것도 안 걸렸다. 유튜브가 워커나 미디어 엔진을 통해 요청을 내보내면 JS 훅을 우회하지만, Resource Timing에는 URL이 남는다(버퍼가 넘치지 않게 `setResourceTimingBufferSize(1000)`으로 키우고 2초마다 훑는다)(요청마다 달라지는 `range`/`rn`/`rbuf`/`sq` 등은 떼고 보관). **이미 재생되고 있는 URL이라 서명·`n`·PO token이 전부 유효**하므로 1MB 제한에 걸리지 않는다. player 응답을 뜯는 아래 경로들과 달리 서명 해독도 필요 없다. 오디오 itag 우선순위는 140 → 141 → 139. `clen`·`dur` 파라미터에서 크기와 길이도 함께 얻는다. 피드에서 인라인 재생하면 주소에 `v=`가 없어 videoId를 알 수 없는데, 그때는 `_last`에 담아 두고 **`clen`이 기대 크기와 정확히 일치할 때만** 쓴다(다른 영상 오디오를 저장하는 사고 방지). 기대 크기는 Dart가 매니페스트에서 얻어 `expectSize`로 넘긴다.
+0. **`MEDIA-PLAYED-<itag>` / `MEDIA-<itag>` — 플레이어가 재생에 쓰던 미디어 URL.**
+   **사용자가 그 영상을 직접 재생한 뒤 저장하는 흐름을 위해 이 후보를 우리가 만든 InnerTube URL보다 먼저 쓴다.** 토큰(`pot`)이 붙어 있으면 최우선(`MEDIA-*`), 토큰이 안 보여도 실제 재생 세션에서 나온 URL이라 성질이 다를 수 있으므로 InnerTube 후보 **앞에서** 한 번 시도한다(`MEDIA-PLAYED-*`). 다운로드 쪽에서도 1MB 제한이 확인된 뒤라도 `MEDIA*` 후보만은 건너뛰지 않는다(`fromPlayback`). 가장 확실하다. `_injectPlayerCapture`가 **Resource Timing**(`performance.getEntriesByType('resource')`)·fetch/XHR·`<video>` 엘리먼트 세 곳에서 `googlevideo.com/videoplayback` URL을 주워 videoId·itag별로 모아 둔다. **Resource Timing이 핵심이다** — 실측(2026-08-18) `video=blob:`(MSE 재생 중)인데도 fetch/XHR 훅에는 아무것도 안 걸렸다. 유튜브가 워커나 미디어 엔진을 통해 요청을 내보내면 JS 훅을 우회하지만, Resource Timing에는 URL이 남는다(버퍼가 넘치지 않게 `setResourceTimingBufferSize(1000)`으로 키우고 2초마다 훑는다)(요청마다 달라지는 `range`/`rn`/`rbuf`/`sq` 등은 떼고 보관). **이미 재생되고 있는 URL이라 서명·`n`·PO token이 전부 유효**하므로 1MB 제한에 걸리지 않는다. player 응답을 뜯는 아래 경로들과 달리 서명 해독도 필요 없다. 오디오 itag 우선순위는 140 → 141 → 139. `clen`·`dur` 파라미터에서 크기와 길이도 함께 얻는다. 피드에서 인라인 재생하면 주소에 `v=`가 없어 videoId를 알 수 없는데, 그때는 `_last`에 담아 두고 **`clen`이 기대 크기와 정확히 일치할 때만** 쓴다(다른 영상 오디오를 저장하는 사고 방지). 기대 크기는 Dart가 매니페스트에서 얻어 `expectSize`로 넘긴다.
 1. `PAGE-CAPTURED` — `_injectPlayerCapture`가 가로챈 **페이지 자신의** player 응답(§2.3.2.1). 토큰이 붙어 있어 가장 좋다.
 2. `ytInitialPlayerResponse` — 지금 웹뷰가 열고 있는 watch 페이지의 초기 응답.
 3. `WATCH-HTML` — **웹뷰 세션으로 `/watch?v=<id>` HTML을 직접 fetch** 해 그 안의 `ytInitialPlayerResponse`를 중괄호 균형으로 잘라 쓴다. 사용자가 **피드 목록의 ⋮에서 바로 저장**하면 1·2가 비는데(그 영상의 watch 페이지를 연 적이 없다) 이 경로가 그때를 메운다.
@@ -232,7 +257,14 @@ dart run --define=VID=<videoId> tool/yt_track_probe.dart  # 오디오 트랙(언
 dart run tool/wowtv_live_probe.dart                      # 한국경제Live 3단계 확인
 dart run tool/yt_repeat_probe.dart                       # 연속 저장 재현 + 단계별 소요시간
 dart run --define=VID=<videoId> tool/yt_client_sweep.dart # 클라이언트 11종 전수 확인
+
+tool/deploy_ios.sh              # 아이폰에 빌드+설치+실행 (기기 자동 탐지, [BT] 로그 표시)
+tool/deploy_ios.sh --install    # 빌드+설치만
+tool/deploy_ios.sh --logs       # 이미 깔린 앱의 로그만
+tool/deploy_ios.sh --clean      # flutter clean 후 처음부터
 ```
+
+`deploy_ios.sh`는 **릴리즈로** 올린다. 실기기 디버그 실행이 "connecting to vmService"에서 멈추는 문제(§3)를 피하기 위함이고, 릴리즈에서도 `debugPrint`는 그대로 나오므로 `[BT]` 로그는 다 보인다.
 
 `tool/`의 스크립트는 flutter 의존 없이 도는 standalone이라 `live_service.dart`의 정규식·요청 형태를 복제해 두었다. 한쪽을 고치면 다른 쪽도 맞출 것.
 

@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:audio_session/audio_session.dart';
 import 'package:flutter/foundation.dart';
 import 'package:just_audio/just_audio.dart';
@@ -57,6 +59,67 @@ bool audioReady = false;
 
 Future<void> ensureAudioReady() => _audioInitFuture ??= _initAudio();
 
+/// 인터럽션(문자·전화·다른 앱 소리)이 끝난 뒤 재생을 되살려야 하는지.
+/// 사용자가 직접 누른 일시정지와 구분해야 하므로 [btPlayIntent]와 별개로 둔다 —
+/// 인터럽트로 인한 정지는 "사용자의 의도"가 아니다(§2.1).
+bool _resumeAfterInterruption = false;
+
+/// iOS 오디오 세션 인터럽션 처리.
+///
+/// **이게 없으면 문자 한 통에 재생이 영영 멈춘다.** 알림음·전화가 오면 iOS가
+/// 세션을 끊는데(`begin`), 앱이 아무것도 하지 않으면 인터럽트가 끝나도
+/// (`end`) 세션이 되살아나지 않아 그대로 무음이 된다. 실제로 그 버그가 났다.
+///
+/// 처리 규칙(just_audio·audio_session이 권장하는 형태):
+/// - `duck`: iOS가 알아서 볼륨만 줄인다 → 건드리지 않는다.
+/// - `pause`/`unknown` 시작: 재생 중이었으면 멈추고 "되살릴 대상"으로 표시.
+/// - `pause` 종료: 사용자의 의도가 여전히 재생이면 세션을 다시 활성화하고 재생.
+/// - `unknown` 종료: 자동 재개하지 않는다. 다른 앱이 오디오를 가져간 경우라
+///   되살리면 남의 재생을 끊는다.
+void _attachInterruptionHandling(AudioSession session) {
+  session.interruptionEventStream.listen((event) async {
+    if (event.begin) {
+      switch (event.type) {
+        case AudioInterruptionType.duck:
+          break;
+        case AudioInterruptionType.pause:
+        case AudioInterruptionType.unknown:
+          if (btPlayer.playing) {
+            // btPlayIntent는 건드리지 않는다. 사용자가 정지한 게 아니다.
+            _resumeAfterInterruption = true;
+            debugPrint('[BT] audio: 인터럽션 시작(${event.type}) → 일시정지');
+            await btPlayer.pause();
+          }
+          break;
+      }
+      return;
+    }
+    switch (event.type) {
+      case AudioInterruptionType.duck:
+        break;
+      case AudioInterruptionType.pause:
+        if (_resumeAfterInterruption && btPlayIntent) {
+          debugPrint('[BT] audio: 인터럽션 종료 → 세션 재활성화 후 재생 재개');
+          // 인터럽트 뒤에는 세션이 비활성 상태다. 살리지 않고 play()만 하면
+          // iOS에서 -11800/-11819로 실패한다(§2.5).
+          try {
+            await session.setActive(true);
+          } catch (e) {
+            debugPrint('[BT] audio: 세션 재활성화 실패 $e');
+          }
+          // play()는 재생이 끝날 때 완료되는 Future다 → await 금지(§2.4.1).
+          unawaited(btPlayer.play());
+        }
+        break;
+      case AudioInterruptionType.unknown:
+        // 다른 앱이 오디오를 가져간 경우. 자동 재개하면 남의 재생을 끊는다.
+        debugPrint('[BT] audio: 인터럽션 종료(unknown) → 자동 재개하지 않음');
+        break;
+    }
+    _resumeAfterInterruption = false;
+  });
+}
+
 Future<void> _initAudio() async {
   debugPrint('[BT] boot: _initAudio start');
   final sw = Stopwatch()..start();
@@ -69,6 +132,7 @@ Future<void> _initAudio() async {
   final session = await AudioSession.instance;
   final tSession = sw.elapsedMilliseconds;
   await session.configure(const AudioSessionConfiguration.music());
+  _attachInterruptionHandling(session);
   audioReady = true;
   debugPrint('[BT] boot: audio init done total=${sw.elapsedMilliseconds}ms '
       '(JustAudioBackground.init=${tInit}ms, '

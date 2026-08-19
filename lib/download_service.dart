@@ -152,6 +152,21 @@ class DownloadService {
   /// 한 조각을 다시 시도하는 최대 횟수. 받은 지점부터 이어 받는다.
   static const int _chunkRetries = 3;
 
+  /// **합본(progressive itag 18)을 먼저 받는다.**
+  ///
+  /// 유튜브가 오디오 전용 포맷에 PO token을 요구하면서(§2.3.2.1) 저장 대상 영상
+  /// 대부분이 첫 1MB에서 403이 된다. 그때마다 오디오 전용 후보들을 훑느라
+  /// 1MB씩 헛되이 받고 10초 이상을 쓴다. itag 18은 토큰 없이 끝까지 받아지므로
+  /// (§2.3.2.4) 그쪽을 먼저 시도해 저장을 빠르고 확실하게 만든다.
+  ///
+  /// 대가: 영상이 섞여 있어 용량이 늘 수 있고(말하는 사람 위주 뉴스는 오히려
+  /// 더 작다 — 15분 VOA 기준 합본 13.3MB vs 오디오 전용 14.8MB), 오디오가
+  /// 96~128kbps로 오디오 전용(132kbps)보다 낮을 수 있다(실측 §2.3.2.4).
+  ///
+  /// false로 되돌리면 예전처럼 오디오 전용을 먼저 시도한다. 유튜브가 토큰
+  /// 요구를 거둬들이면 그렇게 바꿀 것.
+  static const bool _preferMuxed = true;
+
   /// 웹뷰 안에서 받을 때의 조각 크기(1MB). base64로 실려 오므로 실제 메시지는
   /// 약 1.33MB가 된다. 더 키우면 JS 채널 한 번에 오가는 문자열이 커져 위험하다.
   static const int _webViewChunkSize = 1024 * 1024;
@@ -391,8 +406,13 @@ class DownloadService {
                 mimeType: audio.container.name,
                 via: 'manifest',
               )),
+        // 합본 itag18: 토큰 없이 끝까지 받아지는 유일한 포맷(§2.3.2.4).
+        // _preferMuxed면 맨 앞에서 시도해 헛된 1MB 시도를 없앤다.
+        if (_preferMuxed)
+          ('합본 itag18', () => _viaInnerTube(videoId, 'muxed18', _ctxAndroid,
+              muxed: true)),
         // 웹뷰가 **재생 중인 미디어 URL**을 잡아 뒀다면 그게 가장 확실하다
-        // (서명·n·PO token이 이미 유효). 그래서 우리가 만드는 후보들보다 앞에 둔다.
+        // (서명·n·PO token이 이미 유효).
         if (resolveViaWebView != null)
           // 기대 크기를 넘겨 준다. 피드 인라인 재생으로 잡힌 미디어 URL이
           // 이 영상 것인지 확인하는 유일한 근거다(§2.3.3).
@@ -400,11 +420,10 @@ class DownloadService {
         // 패키지가 비디오 스트림 HEAD 403 때문에 버린 클라이언트를 직접 살린다.
         ('직접 androidVr', () => _viaInnerTube(videoId, 'androidVr', _ctxAndroidVr)),
         ('직접 ios', () => _viaInnerTube(videoId, 'ios', _ctxIos)),
-        // 마지막 보루: progressive itag 18(360p 영상+AAC 합본). 오디오 전용
-        // 포맷이 전부 PO token에 막혀도 **이것만은 끝까지 받아진다**(§2.3.2.4).
-        // 영상이 섞여 있어 용량이 늘지만, 저장이 되는 쪽이 낫다.
-        ('합본 itag18', () => _viaInnerTube(videoId, 'muxed18', _ctxAndroid,
-            muxed: true)),
+        // _preferMuxed가 false일 때의 마지막 보루.
+        if (!_preferMuxed)
+          ('합본 itag18', () => _viaInnerTube(videoId, 'muxed18', _ctxAndroid,
+              muxed: true)),
       ];
 
       var received = 0;
@@ -452,9 +471,7 @@ class DownloadService {
           viaWebView = src;
         }
         debugPrint('[BT] download: 시도 [$label] size=$total');
-        onStage?.call(isMuxed
-            ? '오디오 전용이 막혀 합본으로 받는 중...'
-            : '다운로드 중 ($label)...');
+        onStage?.call(isMuxed ? '다운로드 중...' : '다운로드 중 ($label)...');
         try {
           received = await _downloadToFile(
             tmp,
@@ -501,10 +518,13 @@ class DownloadService {
       }
 
       if (!done) {
+        // _preferMuxed면 매니페스트 해석을 건너뛰므로 여기서 사유를 묻는다.
+        // (비공개·삭제·라이브 처리 중 등은 안내가 달라야 한다. §3)
+        final diagnosis = await _diagnoseUnavailable(videoId);
+        if (diagnosis != null) throw diagnosis;
         throw const AudioUnavailableException(
-          '유튜브가 이 영상은 첫 1MB만 내주고 있습니다.\n'
-          '유튜브가 이 영상에 새 전송 방식(SABR)을 적용해서,\n'
-          '지금은 앱에서 받을 방법이 없습니다. 다른 영상은 정상 저장됩니다.',
+          '유튜브가 이 영상의 스트림을 내주지 않습니다.\n'
+          '잠시 후 다시 시도해 주세요.',
           retryable: true,
           botBlocked: true,
         );

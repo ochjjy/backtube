@@ -160,7 +160,11 @@ itag 18 = 360p H.264 + AAC-LC가 하나로 합쳐진(muxed/progressive) mp4. 실
 - `contentLength`를 안 주는 영상이 있다 → `total=0`으로 열린 range(`0-`)를 쓰면 전체가 받아진다.
 - 대가는 **용량**이다. 영상이 섞여 있어 오디오 전용보다 크다(짧은 뉴스는 비슷하거나 오히려 작고, 긴 영상은 2~3배). 오디오 품질도 `AUDIO_QUALITY_LOW`(AAC 약 96kbps)로 itag 140(128kbps)보다 낮다. 말소리 위주 콘텐츠에는 충분하다.
 
-그래서 후보 목록의 **맨 마지막**에 둔다. 오디오 전용이 되면 그쪽이 우선이고, 전부 막혔을 때만 합본으로 받는다. `cappedClients`(§2.3.2.2)에 ANDROID가 들어 있어도 **itag 18은 건너뛰지 않는다** — 토큰을 요구하는 것은 오디오 전용 포맷뿐이다.
+**현재는 `_preferMuxed = true`라 합본을 맨 먼저 받는다.** 저장 대상 영상 대부분이 오디오 전용에서 막히는 상황이라, 후보를 훑느라 1MB씩 헛되이 받고 10초 이상 쓰는 것보다 바로 합본으로 가는 편이 빠르고 확실하기 때문이다. 이때 매니페스트 해석(`_resolveAudioStream`)도 통째로 건너뛴다 — 그래서 전부 실패했을 때의 사유 진단(`_diagnoseUnavailable`)을 다운로드 루프 끝에서 따로 부른다.
+
+유튜브가 토큰 요구를 거둬들이면 `_preferMuxed = false`로 되돌린다. 그러면 오디오 전용이 우선이고 합본은 다시 맨 마지막 보루가 된다.
+
+**음질 실측(2026-08-19, ffprobe)**: 합본의 오디오 트랙은 AAC-LC 44.1kHz 스테레오 **96~128kbps**(영상마다 다름), 오디오 전용 itag140은 132kbps. 코덱·샘플레이트·채널은 같다. itag 22(720p/192k AAC)는 **어떤 클라이언트에도 제공되지 않아** 합본 음질을 더 올릴 방법은 없다. 오디오 전용 쪽도 이미 최선을 고르고 있다(opus 251이 150k로 더 높지만 iOS AVPlayer가 재생 못 한다 — §2.2). `cappedClients`(§2.3.2.2)에 ANDROID가 들어 있어도 **itag 18은 건너뛰지 않는다** — 토큰을 요구하는 것은 오디오 전용 포맷뿐이다.
 
 ### 2.3.3 봇 확인("로그인하여 봇이 아님을 확인하세요") 우회는 웹뷰 세션이다
 유튜브가 봇 확인을 걸면 앱이 Dart에서 보내는 InnerTube 요청은 **어떤 클라이언트로도** 뚫리지 않는다. 실측(2026-08-17, `tool/yt_client_sweep.dart`): 패키지가 주는 11종 중 매니페스트가 나오는 것은 ios·androidVr·android·androidSdkless 넷뿐이고, 나머지(safari/mweb/tv/tvSimplyEmbedded/webCreator/mediaConnect/androidMusic)는 **봇 확인이 걸리지 않은 IP에서도** 전부 실패한다(유튜브가 인증을 요구하도록 바꿨고, 패키지도 셋을 `@Deprecated`로 표시했다). 클라이언트를 더 추가하는 건 우회책이 아니다.
@@ -212,6 +216,18 @@ just_audio의 `play()`가 돌려주는 Future는 **재생이 시작될 때가 �
 [ios/Runner/AppDelegate.swift](ios/Runner/AppDelegate.swift)는 카테고리(`.playback`)만 설정하고 **`setActive`는 하지 않는다**. 앱 실행만으로 다른 앱 음악을 끊지 않기 위함이며, 활성화(`session.setActive(true)`)는 Dart 쪽에서 **재생 직전에** 한다(`SavedAudioPage._play`/`_playFrom`/`_startPlayAll`). 세션이 죽은 상태로 로드하면 iOS에서 `-11800/-11819`로 실패한다.
 
 백그라운드 재생 자체는 `UIBackgroundModes: audio`(iOS)와 `AudioService` 포그라운드 서비스(Android)가 담당한다 — 이미 재생 중인 오디오는 백그라운드로 가도 이어진다.
+
+### 2.5.1 인터럽션 처리는 필수다 (문자 한 통에 재생이 죽는다)
+알림음·전화가 오면 iOS가 오디오 세션을 끊는다. 앱이 아무것도 하지 않으면 인터럽트가 끝나도 세션이 되살아나지 않아 **그대로 무음**이 된다(실제로 "문자 받고 소리가 안 난다"는 버그가 났다). `player_service.dart`의 `_attachInterruptionHandling`이 `session.interruptionEventStream`을 구독해 처리한다:
+
+| 이벤트 | 처리 |
+|---|---|
+| `duck` | 건드리지 않는다(iOS가 볼륨만 줄인다) |
+| `pause`/`unknown` 시작 | 재생 중이었으면 멈추고 `_resumeAfterInterruption` 표시 |
+| `pause` 종료 | `btPlayIntent`가 살아 있으면 **세션 재활성화 후** 재생 재개 |
+| `unknown` 종료 | 자동 재개하지 않는다 — 다른 앱이 오디오를 가져간 경우라 되살리면 남의 재생을 끊는다 |
+
+두 가지를 지킬 것: ⑴ 인터럽트로 인한 정지에 **`btPlayIntent`를 false로 바꾸지 않는다**(사용자가 누른 정지가 아니다 — §2.1). 그래서 별도 플래그를 쓴다. ⑵ 재개 전에 `session.setActive(true)`를 반드시 부른다. 인터럽트 뒤 세션은 비활성이라 그냥 `play()`하면 `-11800/-11819`로 실패한다(§2.5).
 
 ### 2.6 오디오 초기화는 첫 프레임을 막지 않는다
 `main()`은 `ensureAudioReady()`를 `unawaited`로 시작만 하고 `runApp`한다(초기화가 기기에 따라 수 초). 대신 **플레이어를 실제로 쓰기 직전**(`HomeMenuPage._open`)에 `await ensureAudioReady()`로 완료를 보장한다. 새 진입 경로를 추가한다면 이 규칙을 따를 것.
